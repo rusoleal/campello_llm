@@ -1,0 +1,49 @@
+name: CI
+
+# Run on every push and every pull-request, across all branches.
+on:
+  push:
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # campello_llm has no platform-specific code of its own — all backend
+  # selection (CPU/MPSGraph/DirectML/...) lives inside campello_nn, fetched
+  # here via FetchContent. Still need to build/test on each platform's native
+  # toolchain since that's a real variable (campello_nn's own platform-specific
+  # backends compile differently per OS).
+  # ---------------------------------------------------------------------------
+  tests:
+    name: Tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS arm64
+          - os: macos-15-intel
+            name: macOS x64
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+          - os: ubuntu-latest
+            name: Linux x64
+          - os: windows-11-arm
+            name: Windows arm64
+            cmake_arch: -A ARM64
+          - os: windows-latest
+            name: Windows x64
+            cmake_arch: -A x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure
+        run: cmake -B build -DBUILD_TESTS=ON ${{ matrix.cmake_arch }}
+
+      - name: Build
+        run: cmake --build build --target campello_llm_tests
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

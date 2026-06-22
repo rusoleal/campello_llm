@@ -1,0 +1,4 @@
+// the configured options and settings for campello_llm
+#define campello_llm_VERSION_MAJOR @campello_llm_VERSION_MAJOR@
+#define campello_llm_VERSION_MINOR @campello_llm_VERSION_MINOR@
+#define campello_llm_VERSION_PATCH @campello_llm_VERSION_PATCH@

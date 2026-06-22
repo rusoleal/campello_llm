@@ -20,22 +20,19 @@ KV-cache → generate tokens → polish/document.
 
 ## Phase 0 — Project Scaffolding
 
-- [ ] `CMakeLists.txt` (single, no per-platform files) — `FetchContent` for `campello_nn`
-      (`https://github.com/rusoleal/campello_nn.git`, pinned tag) and GoogleTest, mirroring
-      `campello_nn`'s own FetchContent conventions
-- [ ] Directory layout: `include/campello_llm/`, `src/`, `tests/` — mirror `campello_nn`'s
-      `inc`/`src`/`tests` split and its handle-based public-API convention if it fits here too
-      (decide during Phase 3 once `Model`'s actual shape is known)
-- [ ] C++20, GoogleTest + `ctest` wired (`tests/CMakeLists.txt`)
-- [ ] CI workflow (`.github/workflows/ci.yml`) building + testing on macOS/Linux/Windows — even
-      though this project has no platform-specific *code*, it still needs to build against each
-      platform's `campello_nn` build, so CI should cover all three
-- [ ] Root `CLAUDE.md`: architecture summary (weight-only-format scope, why this layer exists
+- [x] `CMakeLists.txt` (single, no per-platform files) — `FetchContent` for `campello_nn`
+      (`https://github.com/rusoleal/campello_nn.git`, pinned commit — no tags exist upstream yet)
+      and GoogleTest, mirroring `campello_nn`'s own FetchContent conventions
+- [x] Directory layout: `include/campello_llm/`, `src/`, `tests/` — mirror `campello_nn`'s
+      `inc`/`src`/`tests` split. Handle-based public-API convention deferred to Phase 3 once
+      `Model`'s actual shape is known
+- [x] C++20, GoogleTest + `ctest` wired (`tests/CMakeLists.txt`)
+- [x] CI workflow (`.github/workflows/ci.yml`) building + testing on macOS/Linux/Windows
+- [x] Root `CLAUDE.md`: architecture summary (weight-only-format scope, why this layer exists
       separately from `campello_nn`, the platform-independence note above), build commands,
       conventions — same role as `campello_nn`'s `CLAUDE.md`
-- [ ] Decide minimum viable first real model to target end-to-end (see "Open Questions") — picking
-      this early shapes every phase below (which tokenizer format, which architecture, which
-      weight-file format get implemented first)
+- [x] Decide minimum viable first real model to target end-to-end (see "Open Questions") — **decided:
+      TinyLlama-1.1B safetensors first, then a small GGUF-quantized model second**
 
 ---
 
@@ -173,13 +170,13 @@ Goal: the actual `generate()` from the architecture doc.
 
 ## Open Questions
 
-- [ ] **Minimum viable first real model** — needs to be small (fast tests, small fixture files)
-      but a real, standard, openly-licensed model, not a toy — same bar `campello_nn`'s YuNet/
-      BlazeFace import tests held. Candidates: a small LLaMA-architecture model (e.g. TinyLlama)
-      for the safetensors+BPE path, and/or a small GGUF-quantized model for the gguf path. Decide
-      before Phase 0 finishes, since it shapes which tokenizer/architecture get built first.
-- [ ] **Tokenizer format priority** — HuggingFace `tokenizer.json` BPE vs. SentencePiece `.model`
-      vs. both. Depends on the model chosen above.
+- [x] **Minimum viable first real model** — **decided:** TinyLlama-1.1B (safetensors) first, then a
+      small GGUF-quantized build of the same architecture second, once the safetensors-path
+      architecture registry/tokenizer plumbing already works. GPT-style architecture (Phase 3) comes
+      after both, specifically to validate the registry generalizes beyond LLaMA-shaped models.
+- [x] **Tokenizer format priority** — **decided:** HuggingFace `tokenizer.json` BPE first (matches
+      TinyLlama's safetensors release); gguf's embedded vocab/merges should reuse the same BPE
+      encode/decode logic rather than a second implementation.
 - [ ] **One shared prefill/decode graph vs. two separately compiled graphs** — a single graph with
       dynamic sequence length is more flexible but may be harder to express cleanly with
       `campello_nn`'s current shape-inference-at-build-time model; two fixed-shape graphs (one for
