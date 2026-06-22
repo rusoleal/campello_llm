@@ -11,9 +11,14 @@ FetchContent_MakeAvailable(googletest)
 
 add_executable(campello_llm_tests
     test_smoke.cpp
+    test_safetensors_reader.cpp
+    test_gguf_reader.cpp
 )
 target_include_directories(campello_llm_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include
+)
+target_compile_definitions(campello_llm_tests PRIVATE
+    CAMPELLO_LLM_TEST_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures"
 )
 target_link_libraries(campello_llm_tests
     campello_llm

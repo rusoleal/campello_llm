@@ -43,6 +43,9 @@ set(BUILD_TESTS ${CAMPELLO_LLM_BUILD_TESTS_REQUESTED} CACHE BOOL "" FORCE)
 # ---------------------------------------------------------------------------
 set(CAMPELLO_LLM_CORE_SOURCES
     src/version.cpp
+    src/safetensors/json_value.cpp
+    src/safetensors/safetensors_reader.cpp
+    src/gguf/gguf_reader.cpp
 )
 
 add_library(${PROJECT_NAME} STATIC
