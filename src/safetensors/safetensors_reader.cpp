@@ -4,7 +4,7 @@
 #include <fstream>
 #include <stdexcept>
 
-#include "json_value.hpp"
+#include "../json/json_value.hpp"
 
 using namespace systems::leal::campello_llm;
 using namespace systems::leal::campello_llm::internal;

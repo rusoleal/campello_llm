@@ -66,17 +66,30 @@ view, with zero knowledge yet of what architecture the tensors belong to.
 Goal: text ↔ token ids, for whichever tokenizer format the chosen first model (see Open Questions)
 actually ships.
 
-- [ ] Tokenizer support for one format first (likely HuggingFace `tokenizer.json` BPE, since it's
-      the most common safetensors-adjacent format; gguf models carry vocab/merges embedded
-      already, read by Phase 1's gguf reader, so the same BPE encode/decode logic should be
-      reusable against either source)
-- [ ] Encode: text → token ids (BPE merge algorithm)
-- [ ] Decode: token ids → text
-- [ ] Special tokens (BOS/EOS/PAD/UNK) and basic chat template handling (enough to format a
-      single-turn prompt correctly for the chosen first model)
-- [ ] Tests: encode/decode round-trip, and encode output checked against a known-good reference
-      tokenization for a handful of real strings (generated once via Python's `transformers`
-      or `tokenizers` library and checked into a fixture file)
+- [x] Tokenizer support for one format first — HuggingFace `tokenizer.json` BPE, specifically the
+      SentencePiece-style byte-fallback variant LLaMA/TinyLlama ships (see `CLAUDE.md` for the exact
+      supported normalizer/decoder/post_processor shapes; other shapes, e.g. GPT-2/Llama-3's
+      `ByteLevel` pre_tokenizer, throw rather than silently mistokenizing). **Not yet done:** a
+      `GgufFile` -> `Tokenizer` adapter for gguf's embedded `tokenizer.ggml.tokens`/`merges`
+      metadata (a different on-disk representation of the same vocab/merges data Phase 1's gguf
+      reader already exposes generically) — left for whenever the second, gguf-format target model
+      (see `TODO.md` Open Questions) is actually wired up.
+- [x] Encode: text → token ids (BPE merge algorithm, with byte-fallback and literal added-token
+      recognition — e.g. `</s>` in raw input is recognized as id 2, not BPE'd character-by-character)
+- [x] Decode: token ids → text (full decoder chain: `Replace`/`ByteFallback`/`Fuse`/`Strip`)
+- [x] Special tokens (BOS/EOS/PAD/UNK) — `Tokenizer::bosId()`/`unkId()` from `tokenizer.json`;
+      EOS/PAD aren't derivable from that file alone, so a separate small `tokenizer_config.json`
+      reader (`tokenizer_config.hpp`) resolves those by token *text*, then `Tokenizer::tokenToId()`
+      resolves the id — and basic chat template handling (`formatSingleTurnChatPrompt()`, the
+      literal `"<|role|>\n{content}{eos}\n<|assistant|>\n"` shape TinyLlama-Chat/Zephyr-style models
+      use — not a Jinja2 `chat_template` interpreter)
+- [x] Tests: encode/decode round-trip (49 tests total, including negative tests for unsupported
+      tokenizer.json shapes), and encode output checked against a known-good reference tokenization
+      for real strings (CJK, emoji/byte-fallback, accented Latin, multi-space, literal added-token
+      recognition, full chat-prompt formatting) generated via the real `tokenizers` Python package
+      and (for the chat template) `jinja2` with HuggingFace's default `Environment` settings —
+      checked into `tests/fixtures/tinyllama_tokenizer{,_config}.json` (the real TinyLlama files,
+      not synthetic — see `tests/fixtures/NOTICE.md`)
 
 ---
 

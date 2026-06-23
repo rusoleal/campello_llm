@@ -9,16 +9,16 @@ namespace systems::leal::campello_llm::internal
 {
 
     /**
-     * @brief Minimal hand-rolled JSON parser, scoped to reading a safetensors header.
+     * @brief Minimal hand-rolled JSON parser, shared by the safetensors header reader
+     * and the HuggingFace `tokenizer.json`/`tokenizer_config.json` reader.
      *
-     * Safetensors headers are JSON written by Python's `json` module (objects, string
-     * keys, string/integer-array values) — a small, fixed shape that doesn't justify a
-     * full JSON dependency, same "hand-roll the minimal reader for a known, stable
-     * format" call campello_nn's `proto_reader.hpp` made for ONNX's protobuf. Still a
-     * real, generic recursive-descent JSON parser (objects/arrays/strings/numbers/
-     * bools/null, with string escapes including `\uXXXX`) rather than a
-     * safetensors-specific shortcut, since nothing about JSON syntax itself is
-     * safetensors-specific.
+     * Both formats are JSON written by Python's `json` module — small, well-defined
+     * shapes that don't justify a full JSON dependency, same "hand-roll the minimal
+     * reader for a known, stable format" call campello_nn's `proto_reader.hpp` made
+     * for ONNX's protobuf. Still a real, generic recursive-descent JSON parser
+     * (objects/arrays/strings/numbers/bools/null, with string escapes including
+     * `\uXXXX`) rather than a format-specific shortcut, since nothing about JSON
+     * syntax itself is specific to either consumer.
      */
     enum class JsonType
     {

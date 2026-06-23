@@ -13,6 +13,7 @@ add_executable(campello_llm_tests
     test_smoke.cpp
     test_safetensors_reader.cpp
     test_gguf_reader.cpp
+    test_tokenizer.cpp
 )
 target_include_directories(campello_llm_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include

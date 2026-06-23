@@ -67,12 +67,12 @@ Android `AAssetManager` read) can be freed immediately after the call returns.
 - **safetensors**: 8-byte little-endian header length, then a JSON header (tensor name ->
   `{dtype, shape, data_offsets}`, plus an optional `__metadata__` string map), then raw tensor
   bytes. The JSON header is parsed by a small hand-rolled recursive-descent parser
-  (`src/safetensors/json_value.{hpp,cpp}`, internal) rather than a JSON dependency — same
-  "hand-roll the minimal reader for a known, stable format" call `proto_reader.hpp` made for ONNX's
-  protobuf in `campello_nn`. Dtype strings verified against the real `safetensors` Rust crate's
-  `Dtype` enum (fetched from its GitHub source) before trusting them; sub-byte (F4/F6_*), exotic
-  float8 (F8_*), and complex (C64) types have no campello_llm representation yet and throw rather
-  than guess a conversion.
+  (`src/json/json_value.{hpp,cpp}`, internal — shared with the Phase 2 tokenizer reader below)
+  rather than a JSON dependency — same "hand-roll the minimal reader for a known, stable format"
+  call `proto_reader.hpp` made for ONNX's protobuf in `campello_nn`. Dtype strings verified against
+  the real `safetensors` Rust crate's `Dtype` enum (fetched from its GitHub source) before trusting
+  them; sub-byte (F4/F6_*), exotic float8 (F8_*), and complex (C64) types have no campello_llm
+  representation yet and throw rather than guess a conversion.
 - **gguf**: magic + version, a key/value metadata block, a tensor info table, then tensor data
   (offsets relative to an aligned data-section start — default alignment 32, overridable by a
   `general.alignment` metadata key). All field layouts/enum values (`GGUFValueType`,
@@ -93,6 +93,66 @@ real `safetensors`/`gguf` Python packages (`tests/fixtures/generate_test_safeten
 hardcoded in `tests/test_safetensors_reader.cpp`/`test_gguf_reader.cpp` was independently confirmed
 against the actual generated file (raw hex dump for safetensors, `python3 -m
 gguf.scripts.gguf_dump` for gguf) before being written into the test, not assumed.
+
+### Tokenizer (Phase 2)
+
+`include/campello_llm/tokenizer.hpp`'s `Tokenizer` reads a HuggingFace "fast" `tokenizer.json`,
+scoped specifically to the SentencePiece-style byte-fallback BPE shape LLaMA/TinyLlama-family
+models ship — **not** a general tokenizer.json interpreter. It requires `model.type == "BPE"` with
+`byte_fallback`, and matches exactly one of two shapes for each of `normalizer`/`decoder`/
+`post_processor`: `null`, or the specific `Sequence` shape verified against TinyLlama's real
+tokenizer.json (`Sequence[Prepend("▁"), Replace(" "->"▁")]` for the normalizer;
+`Sequence[Replace("▁"->" "), ByteFallback, Fuse, Strip(" ",1,0)]` for the decoder;
+`TemplateProcessing`'s `single` template for the post-processor). `pre_tokenizer` must be `null`
+(the whole normalized text is one BPE "word" — no `ByteLevel`-style pre-splitting, which is a
+structurally different algorithm GPT-2/Llama-3 use instead). Every one of these shapes, plus the
+BPE merge/byte-fallback algorithm itself, was verified against the real `huggingface/tokenizers`
+Rust source (`models/bpe/{model,word}.rs`, `decoders/{byte_fallback,strip}.rs`,
+`normalizers/prepend.rs`, fetched from GitHub) before being trusted — not assumed from memory.
+Anything else throws rather than silently mistokenizing.
+
+- **Encode**: literal occurrences of any `added_tokens` string (e.g. `</s>`) are recognized and
+  emitted as that token's id directly, scanning left-to-right with longest-content-first matching,
+  *regardless* of `addSpecialTokens` — confirmed this is real behavior (not a bug) by checking the
+  real tokenizer's output on `"a</s>b"` with `add_special_tokens=False`. `addSpecialTokens` only
+  controls whether the post-processor's template token (`Tokenizer::bosId()`) gets prepended.
+  Plain-text segments between added-token matches are normalized (if a normalizer is configured)
+  and BPE-tokenized independently — `Tokenizer::bpeTokenizeWord()` splits per-Unicode-character
+  (not per-byte), looks each character up in vocab directly, and falls back to per-byte
+  `<0xXX>`-format vocab entries (`byte_fallback`) for characters with no direct vocab entry (CJK/
+  emoji in TinyLlama's case), then repeatedly merges the lowest-rank adjacent pair (by index in
+  `model.merges`) until none remain — logically equivalent to the real implementation's
+  priority-queue approach, just a simpler full-rescan-per-merge (words here are a single chat
+  message, not a training corpus, so this is in no way performance-critical).
+- **Decode**: applies the verified decoder chain (space-marker replace, byte-fallback
+  reassembly — with the real "each invalid byte becomes its own U+FFFD" fallback, not a single
+  replacement for the whole run — fuse, then strip exactly one leading space, undoing the
+  normalizer's artificial leading `"▁"`).
+- **Chat prompt**: `formatSingleTurnChatPrompt(role, content, eosToken)` renders the literal
+  `"<|{role}|>\n{content}{eosToken}\n<|assistant|>\n"` shape — confirmed against the real
+  `chat_template` (a Jinja2 string in `tokenizer_config.json`) actually rendered with `jinja2`
+  using HuggingFace's default `Environment(trim_blocks=True, lstrip_blocks=True,
+  keep_trailing_newline=True)`, not guessed from reading the Jinja source. This is **not** a Jinja2
+  interpreter — a different model's `chat_template` with a different literal shape needs a new
+  formatting function, not a config flag here.
+- **EOS/PAD**: not derivable from `tokenizer.json` alone (no field for it — only the post-processor
+  implies a "BOS-like" token). `include/campello_llm/tokenizer_config.hpp`'s
+  `loadSpecialTokenStringsFromFile()` reads `tokenizer_config.json`'s `bos_token`/`eos_token`/
+  `unk_token`/`pad_token` (plain string or `{"content": "..."}` object) as literal text; resolve to
+  an id via `Tokenizer::tokenToId()`. Kept deliberately separate from `Tokenizer` rather than
+  merged in, since it's a different file with a different (much simpler) shape.
+- **Not yet done**: a `GgufFile` -> `Tokenizer` adapter for gguf's embedded
+  `tokenizer.ggml.tokens`/`merges` metadata (Phase 1's gguf reader already exposes these generically
+  via `GgufFile::metadata()`, but nothing builds a `Tokenizer` from them yet) — deferred until the
+  second, gguf-format target model is actually wired up (see `TODO.md` Open Questions).
+
+Test fixtures are the **real** `tokenizer.json`/`tokenizer_config.json` from
+`TinyLlama/TinyLlama-1.1B-Chat-v1.0` (Apache-2.0, see `tests/fixtures/NOTICE.md`) — not synthetic,
+since the whole point is validating against the model this project actually targets. Every expected
+token id list / decoded string in `tests/test_tokenizer.cpp` was independently confirmed against the
+real `tokenizers` Python package (`pip install tokenizers`; `Tokenizer.from_file(path).encode()`/
+`.decode()`) before being hardcoded — including CJK, emoji/byte-fallback, accented Latin text, and
+the literal-added-token-recognition edge case above.
 
 ### First Target Model (decision recorded here, not yet implemented)
 
@@ -129,6 +189,6 @@ to validate the architecture registry generalizes instead of being accidentally 
 
 ## Current State
 
-Phase 0 (scaffolding) and Phase 1 (weights-file parsing — safetensors + gguf readers, see above)
-are done. No tokenizer, architecture wiring, or generation logic exists yet — see `TODO.md` for the
-full phased plan, starting at Phase 2 (tokenizer).
+Phase 0 (scaffolding), Phase 1 (weights-file parsing), and Phase 2 (tokenizer — see above) are
+done. No architecture wiring or generation logic exists yet — see `TODO.md` for the full phased
+plan, starting at Phase 3 (architecture registry / graph wiring).
