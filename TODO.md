@@ -100,25 +100,41 @@ using `GraphBuilder` calls with weights bound via `constant()`. This is the laye
 `campello_llm` existing separately from `campello_nn` — the architecture knowledge a graph-format
 file would have carried for free.
 
-- [ ] `GenerationConfig` struct (maxTokens, temperature, topP, topK)
-- [ ] LLaMA-style architecture wiring: embedding (`gather`) → N decoder layers (`rmsNorm` →
-      `rotaryEmbedding`-applied attention with causal masking via a precomputed additive mask
-      constant + `softmax` → `rmsNorm` → SwiGLU MLP composed from `sigmoid`+`mul` for SiLU) →
-      final `rmsNorm` → output projection (`matmul`/`gemm`). All the ops this needs
-      (`rmsNorm`/`rotaryEmbedding`) already exist in `campello_nn` — see its `TODO.md` Phase 5
-      "Op-set prep" section for exactly how each is implemented and on which backends
-- [ ] Decide: one graph covering both prefill (full-sequence) and decode (single-token + KV-cache
-      read/write), or two separately compiled graphs with different input shapes — see Open
-      Questions
-- [ ] GPT-style architecture wiring as a second case (`layerNorm` instead of `rmsNorm`, `gelu`
-      instead of SwiGLU, no RoPE) — deliberately doing a second, structurally different
-      architecture early validates the registry abstraction generalizes instead of accidentally
-      being LLaMA-shaped
-- [ ] Architecture registry: dispatch by the architecture name read from `config.json` (safetensors
-      case) or the `general.architecture` gguf metadata key, to the matching wiring function above
-- [ ] Tests: build a tiny synthetic model (small hidden size, 1-2 layers, hand-picked weights) for
-      each architecture and check graph output against an independently hand/numpy-computed
-      reference — same pattern as `campello_nn`'s `test_transformer_block.cpp`
+- [x] `GenerationConfig` struct (maxTokens, temperature, topP, topK) — `generation_config.hpp`,
+      not consumed yet (Phase 5)
+- [x] LLaMA-style architecture wiring (`buildLlamaGraph()`, `src/architecture/llama_architecture.cpp`):
+      embedding (`gather`) → N decoder layers (`rmsNorm` → GQA attention with `rotaryEmbedding` +
+      causal masking via a precomputed additive mask constant + `softmax` → residual → `rmsNorm` →
+      SwiGLU MLP composed from `sigmoid`+`mul` for SiLU → residual) → final `rmsNorm` → `lm_head`
+      `matmul`. GQA's repeat-kv (`numKeyValueHeads < numAttentionHeads`, confirmed against TinyLlama's
+      real `config.json`: 4 KV heads vs. 32 attention heads) is done via `slice()`+`concat()` since
+      `matmul()` requires exactly-matching batch dimensions — see `repeatKvHeads()` in
+      `src/architecture/weight_loading.cpp`.
+- [x] **Decided: two separately compiled graphs (prefill N-token, decode 1-token), not one
+      dynamic-shape graph** — not really a style choice, `campello_nn::GraphBuilder::input()` bakes
+      an exact `TensorDescriptor` shape into the graph at build time (no `-1`/dynamic-dimension
+      concept exists), so a single graph can't flexibly cover both an N-token prefill pass and a
+      1-token decode step. `buildLlamaGraph()`/`buildGptGraph()` take a fixed `seqLen` and currently
+      only build the prefill shape (no KV-cache reads yet — that's Phase 4's "decode" graph).
+- [x] GPT-style architecture wiring as a second case (`buildGptGraph()`,
+      `src/architecture/gpt_architecture.cpp`): `layerNorm` instead of `rmsNorm`, exact (erf-based)
+      `gelu` instead of SwiGLU, learned absolute positional embeddings instead of RoPE, plain MHA
+      instead of GQA, and — confirmed against the real `openai-community/gpt2` checkpoint — `[in,
+      out]`-layout `Conv1D` weights (the *opposite* of LLaMA's `nn.Linear` `[out,in]`) and a tied
+      `lm_head` (no separate weight tensor at all). This structural divergence is exactly what
+      validates the registry generalizes instead of being accidentally LLaMA-shaped.
+- [x] Architecture registry (`buildGraphForArchitecture()`, `src/architecture/architecture_registry.cpp`):
+      dispatches by architecture name (`"llama"`/`"gpt2"`) to the matching wiring function above.
+      Scope note: this dispatches on an already-parsed `LlamaConfig`/`GptConfig` — actually parsing
+      `config.json`'s `model_type` or gguf's `general.architecture` key into one of those structs is
+      Phase 4's `Model::load()` job, not this registry's.
+- [x] Tests: a tiny synthetic model per architecture (`tests/fixtures/generate_{llama,gpt}_test_fixture.py`,
+      hand-picked tiny hidden sizes, 2 layers, fixed-seed random weights) checked against an
+      independently-written-from-scratch numpy reference forward pass (not sharing code with the
+      C++ wiring) — same pattern as `campello_nn`'s `test_transformer_block.cpp`. Both matched on
+      the first real run (within `1e-3` float tolerance), which is reasonably strong evidence the
+      GQA/RoPE/Conv1D-vs-nn.Linear/tied-embedding handling above is actually correct, not just
+      plausible-looking.
 
 ---
 
@@ -128,16 +144,37 @@ Goal: tie weights + tokenizer + architecture wiring + a `campello_nn::Context` t
 loadable `Model` from the architecture doc, plus the stateful bookkeeping a WebNN-shaped graph
 doesn't model on its own.
 
-- [ ] `Model::load(context, path)` (and a `loadFromMemory`-style variant for the Android-asset
-      case) — detects format (safetensors vs gguf) and architecture, builds or loads the graph
-- [ ] Support loading a pre-cached graph via `campello_nn`'s graph caching
-      (`loadGraphFromFile`/`loadGraphFromMemory`) instead of rebuilding one live every time —
-      `Model::load()` should check for a cached sibling file first and fall back to building fresh
-- [ ] KV-cache: explicit `Tensor`s fed back as inputs each decode step and read back out; decide
-      pre-allocate-to-`maxTokens` vs. dynamic growth (see Open Questions)
-- [ ] Tests: decoding token-by-token through the KV-cache produces the same logits as a single
+- [x] `Model::load(context, directory)` — reads `config.json`/`tokenizer.json`/`tokenizer_config.json`/
+      `model.safetensors` from a directory (the standard HF layout) and builds one fixed-`seqLen=1`
+      KV-cache decode graph (`buildLlamaDecodeGraph()`), sized to `maxSequenceLength`'s cache
+      capacity. **Scope cut still standing** (see `CLAUDE.md`): only the safetensors+LLaMA path is
+      wired (no gguf-format dispatch, no `loadFromMemory` Android-asset variant yet) — revisit
+      if/when the gguf target model or Android packaging is actually worked on.
+- [x] **Graph caching implemented.** `Model::load()` checks for a sibling
+      `campello_llm_decode_graph.<maxSequenceLength>.cache` file first (`graphCachePath()`/
+      `isGraphCacheFresh()` in `src/model.cpp`, an mtime check against `model.safetensors`/
+      `config.json`) and loads it via `campello_nn::loadGraphFromFile()` instead of rebuilding —
+      falling back to building fresh (then writing a new cache, best-effort) on a missing, stale, or
+      corrupt/incompatible-version cache. See `CLAUDE.md` for detail; covered by
+      `Model.GraphCacheRoundTripProducesIdenticalOutput`/`Model.CorruptGraphCacheFallsBackToBuildingFresh`.
+- [x] **Real KV-cache implemented.** `buildLlamaDecodeGraph()` (`src/architecture/llama_architecture.cpp`)
+      builds a single fixed-`seqLen=1` graph with explicit per-layer K/V cache tensors as
+      inputs/outputs (`campello_nn` graphs are stateless, so the cache lives in host-managed
+      `Tensor`s `Model::generate()` feeds back in/reads back out each call — see `CLAUDE.md`). One
+      graph total, not a separate batched-prefill graph plus decode graph, specifically so weights
+      bound via `constant()` aren't duplicated across two compiled graphs (~4GB → ~8GB for
+      TinyLlama's decoded Float32 weights) — the tradeoff is prefill becomes `promptLength`
+      sequential small dispatches through that same graph rather than one batched dispatch. Total
+      cost: `O(1)` of the heavy per-token matmuls per generated token (not the whole sequence's, per
+      the old brute-force re-dispatch) plus the unavoidable `O(position)` attention-over-the-cache
+      cost — `O(n)` amortized per token instead of the old `O(maxSequenceLength)` per token.
+- [x] Tests: decoding token-by-token through a real KV-cache produces the same logits as a single
       one-shot prefill over the equivalent full sequence (the standard correctness check for any
-      KV-cache implementation)
+      KV-cache implementation) — `LlamaArchitecture.DecodeGraphMatchesBatchedPrefillPerPosition` in
+      `tests/test_llama_architecture.cpp`, checked against the same numpy-verified `expected[]` rows
+      `MatchesNumpyReferenceForwardPass` already validates. `test_model.cpp`'s existing tests
+      (determinism/streaming/stop-condition) now exercise the KV-cache path end-to-end too, unchanged
+      since `Model`'s public API didn't change.
 
 ---
 
@@ -145,14 +182,20 @@ doesn't model on its own.
 
 Goal: the actual `generate()` from the architecture doc.
 
-- [ ] Prefill: single graph dispatch over the full prompt
-- [ ] Decode loop: one graph dispatch per token, feeding KV-cache deltas from Phase 4
-- [ ] Sampling on CPU after reading back logits: temperature scaling, top-k, top-p; greedy/argmax
-      as a baseline deterministic mode (needed for the determinism test below)
-- [ ] Streaming: `generate()`'s `onToken` callback invoked per generated token
-- [ ] Stop conditions: max tokens, EOS token, stop sequences
-- [ ] Tests: deterministic generation test (temperature=0/greedy) against a known-good reference
-      output for the chosen small first model — the first real end-to-end test of the whole stack
+- [x] Prefill: one graph dispatch per prompt token through the KV-cache decode graph (see Phase 4
+      — no separate batched-prefill graph, deliberately, to avoid duplicating weight memory)
+- [x] Decode loop: one graph dispatch per token, feeding KV-cache deltas from Phase 4
+- [x] Sampling on CPU after reading back logits: temperature scaling, top-k, top-p; greedy/argmax
+      as a baseline deterministic mode (`sampleNextToken()` in `src/model.cpp`)
+- [x] Streaming: `generate()`'s `onToken` callback invoked per generated token — decodes the full
+      generated-so-far id list fresh each step and emits only the new suffix, to handle
+      byte-fallback tokens spanning multiple ids correctly rather than assuming one token = one
+      text chunk
+- [x] Stop conditions: max tokens, EOS token, stop sequences (`GenerationConfig::stopSequences`)
+- [x] Tests: deterministic generation test (temperature=0/greedy) — `Model.GreedyGenerationIsDeterministic`
+      in `test_model.cpp`, against a tiny synthetic fixture (`tests/fixtures/tiny_llama_model/`,
+      generated via the real `tokenizers`/`safetensors` Python packages) rather than the chosen real
+      first model — see Phase 6 / `CLAUDE.md` for the real-TinyLlama end-to-end attempt.
 
 ---
 
@@ -162,11 +205,27 @@ Goal: the actual `generate()` from the architecture doc.
       backends on a given platform, assert outputs agree within per-dtype tolerance (mirrors
       `campello_nn`'s own Phase 6 plan)
 - [ ] Performance benchmarks: prefill throughput, decode tokens/sec, per backend
-- [ ] Example: minimal CLI chat/completion demo using a small real open-weights model
+- [x] Example: minimal CLI chat/completion demo using a small real open-weights model
+      (`examples/cli_chat/`, built ahead of schedule alongside Phases 4-5 — see `CLAUDE.md` —
+      against TinyLlama-1.1B-Chat-v1.0; see the note immediately below on how well that holds up
+      performance-wise even with the Phase 4 KV-cache now in place)
 - [ ] Example: graph-caching demo (load a model once, cache its compiled graph, reload the cache
       on a second run) to demonstrate the startup-cost savings `campello_nn`'s graph caching exists
       for
 - [ ] Public headers finalized under `include/campello_llm/`
+
+**Real end-to-end attempt against the actual TinyLlama checkpoint, post-KV-cache:** running
+`examples/cli_chat/` against the real `TinyLlama/TinyLlama-1.1B-Chat-v1.0` checkpoint on the CPU
+backend, the prompt's prefill alone (a handful of tokens) took multiple minutes and didn't visibly
+finish within 15+ minutes. This is **not** the old `O(maxSequenceLength²)` bug recurring — the
+Phase 4 KV-cache test (`LlamaArchitecture.DecodeGraphMatchesBatchedPrefillPerPosition`) confirms the
+wiring only does `O(1)` heavy-matmul work per token now, not `O(maxSequenceLength)`. The remaining
+bottleneck is that a *single* token's forward pass through all 22 layers of a 1.1B-parameter model
+is itself slow on `campello_nn`'s current CPU backend, which has no BLAS/SIMD-optimized GEMM kernel
+— a `campello_nn`-side performance question, not a `campello_llm` correctness or architecture issue.
+Performance benchmarking (the unchecked item above) should quantify this precisely before deciding
+whether it's worth a `campello_nn` CPU-backend optimization pass or considered acceptable for a
+reference/example backend.
 
 ---
 
@@ -190,15 +249,19 @@ Goal: the actual `generate()` from the architecture doc.
 - [x] **Tokenizer format priority** — **decided:** HuggingFace `tokenizer.json` BPE first (matches
       TinyLlama's safetensors release); gguf's embedded vocab/merges should reuse the same BPE
       encode/decode logic rather than a second implementation.
-- [ ] **One shared prefill/decode graph vs. two separately compiled graphs** — a single graph with
-      dynamic sequence length is more flexible but may be harder to express cleanly with
-      `campello_nn`'s current shape-inference-at-build-time model; two fixed-shape graphs (one for
-      the N-token prompt, one for 1-token decode steps) is more mechanical but means rebuilding/
-      recompiling if `maxTokens` assumptions change. Decide in Phase 3.
-- [ ] **KV-cache growth strategy** — pre-allocate `Tensor`s sized to `GenerationConfig::maxTokens`
-      (simple, wastes memory for short generations) vs. dynamic growth (more complex, needs a
-      reallocate-and-copy or chunked strategy since `campello_nn` `Tensor`s aren't resizable in
-      place). Decide in Phase 4.
+- [x] **One shared prefill/decode graph vs. two separately compiled graphs** — **decided in Phase 4:
+      one shared `seqLen=1` graph** (`buildLlamaDecodeGraph()`), used for both prefill (dispatched
+      once per prompt token) and decode, specifically so weights bound via `constant()` are never
+      duplicated across two compiled graphs (a batched-prefill graph plus a separate decode graph
+      would double resident weight memory, ~4GB → ~8GB for TinyLlama). Cost: prefill is
+      `promptLength` sequential small dispatches instead of one batched dispatch — judged worth it
+      given the project's actual memory constraints (see `CLAUDE.md`).
+- [x] **KV-cache growth strategy** — **decided in Phase 4: pre-allocate, sized to
+      `maxSequenceLength`** (the `Model::load()`-time cache capacity), not `GenerationConfig::maxTokens`
+      (a per-`generate()`-call value not known at graph-build time, since the graph is built once at
+      `load()`). This was the only option actually available, not a tradeoff decision — the decode
+      graph's per-layer cache-tensor shape is baked in at build time, and `maxSequenceLength` is the
+      only relevant value that exists then.
 - [ ] **DirectML `RmsNorm` gap** — `campello_nn`'s DirectML backend doesn't implement `RmsNorm` yet
       (throws clearly rather than guessing; see that project's `TODO.md` Phase 5 "Op-set prep"
       note on `DML_MEAN_VARIANCE_NORMALIZATION1_OPERATOR_DESC`). LLaMA-style wiring (Phase 3) won't
