@@ -48,6 +48,10 @@ set(CAMPELLO_LLM_CORE_SOURCES
     src/gguf/gguf_reader.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/tokenizer_config.cpp
+    src/architecture/weight_loading.cpp
+    src/architecture/llama_architecture.cpp
+    src/architecture/gpt_architecture.cpp
+    src/architecture/architecture_registry.cpp
 )
 
 add_library(${PROJECT_NAME} STATIC

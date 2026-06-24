@@ -14,6 +14,9 @@ add_executable(campello_llm_tests
     test_safetensors_reader.cpp
     test_gguf_reader.cpp
     test_tokenizer.cpp
+    test_llama_architecture.cpp
+    test_gpt_architecture.cpp
+    test_architecture_registry.cpp
 )
 target_include_directories(campello_llm_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include
