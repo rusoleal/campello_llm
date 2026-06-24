@@ -20,14 +20,18 @@ configure_file(src/campello_llm_config.h.in campello_llm_config.h)
 # backend (CPU/MPSGraph/DirectML/...) per-platform internally, so no
 # per-platform .cmake files are needed here.
 #
-# campello_nn's own CMakeLists.txt declares an `option(BUILD_TESTS ...)` with
-# the same name as ours — force it off while fetching so a `-DBUILD_TESTS=ON`
-# meant for campello_llm's own tests doesn't also build (and run, via ctest)
-# campello_nn's universal test suite, whose fixture paths resolve against
-# *this* project's source tree and fail for reasons unrelated to campello_llm.
+# campello_nn's own CMakeLists.txt declares `option(BUILD_TESTS ...)` and
+# `option(BUILD_EXAMPLES ...)` with the same names as ours — force both off
+# while fetching so a `-DBUILD_TESTS=ON`/`-DBUILD_EXAMPLES=ON` meant for
+# campello_llm's own tests/examples doesn't also build campello_nn's (its
+# universal test suite's fixture paths resolve against *this* project's source
+# tree and fail for reasons unrelated to campello_llm; its example is just
+# redundant noise).
 # ---------------------------------------------------------------------------
 set(CAMPELLO_LLM_BUILD_TESTS_REQUESTED ${BUILD_TESTS})
+set(CAMPELLO_LLM_BUILD_EXAMPLES_REQUESTED ${BUILD_EXAMPLES})
 set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     campello_nn
@@ -37,6 +41,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(campello_nn)
 
 set(BUILD_TESTS ${CAMPELLO_LLM_BUILD_TESTS_REQUESTED} CACHE BOOL "" FORCE)
+set(BUILD_EXAMPLES ${CAMPELLO_LLM_BUILD_EXAMPLES_REQUESTED} CACHE BOOL "" FORCE)
 
 # ---------------------------------------------------------------------------
 # Core sources
@@ -52,6 +57,8 @@ set(CAMPELLO_LLM_CORE_SOURCES
     src/architecture/llama_architecture.cpp
     src/architecture/gpt_architecture.cpp
     src/architecture/architecture_registry.cpp
+    src/architecture/llama_config_reader.cpp
+    src/model.cpp
 )
 
 add_library(${PROJECT_NAME} STATIC
@@ -77,4 +84,13 @@ option(BUILD_TESTS "Build unit tests" OFF)
 if(BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Examples
+# ---------------------------------------------------------------------------
+option(BUILD_EXAMPLES "Build example applications" OFF)
+
+if(BUILD_EXAMPLES)
+    add_subdirectory(examples/cli_chat)
 endif()

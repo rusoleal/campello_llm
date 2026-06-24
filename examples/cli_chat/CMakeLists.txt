@@ -1,0 +1,3 @@
+add_executable(campello_llm_cli_chat main.cpp)
+target_link_libraries(campello_llm_cli_chat campello_llm)
+set_target_properties(campello_llm_cli_chat PROPERTIES CXX_STANDARD 20)

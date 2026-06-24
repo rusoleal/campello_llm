@@ -17,6 +17,8 @@ add_executable(campello_llm_tests
     test_llama_architecture.cpp
     test_gpt_architecture.cpp
     test_architecture_registry.cpp
+    test_llama_config_reader.cpp
+    test_model.cpp
 )
 target_include_directories(campello_llm_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/include

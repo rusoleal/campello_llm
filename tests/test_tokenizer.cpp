@@ -212,6 +212,17 @@ TEST(Tokenizer, MinimalTokenizerWithNoOptionalSectionsWorks)
     EXPECT_EQ(tok->decode({2}), "ab");
 }
 
+TEST(Tokenizer, MergesAsTwoElementArraysAlsoSupported)
+{
+    // Newer `tokenizers` versions (confirmed against the real library, 0.22.2)
+    // serialize each merge as ["left","right"] instead of the older single
+    // "left right" string TinyLlama's real tokenizer.json (and
+    // minimalValidTokenizerJson() above) uses -- both are real, valid shapes.
+    std::string json = R"({"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":[["a","b"]]}})";
+    auto tok = loadTokenizerFromMemory(json.data(), json.size());
+    EXPECT_EQ(tok->encode("ab", false), (std::vector<std::int32_t>{2}));
+}
+
 TEST(Tokenizer, UnsupportedModelTypeThrows)
 {
     std::string json = R"({"model":{"type":"Unigram","vocab":{},"merges":[]}})";

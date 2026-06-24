@@ -483,24 +483,45 @@ namespace systems::leal::campello_llm
         for (std::size_t rank = 0; rank < merges->arrayValue.size(); ++rank)
         {
             const JsonValue &mergeEntry = merges->arrayValue[rank];
-            if (mergeEntry.type != JsonType::String)
+            std::string left;
+            std::string right;
+            std::string description; // for error messages only
+            if (mergeEntry.type == JsonType::String)
             {
-                throw std::runtime_error("campello_llm: unsupported merges entry shape (expected a string)");
+                // Older `tokenizers` versions (e.g. the one that produced TinyLlama's
+                // real tokenizer.json) serialize merges as a single "left right"
+                // string.
+                std::size_t sep = mergeEntry.stringValue.find(' ');
+                if (sep == std::string::npos)
+                {
+                    throw std::runtime_error("campello_llm: malformed merges entry '" + mergeEntry.stringValue + "'");
+                }
+                left = mergeEntry.stringValue.substr(0, sep);
+                right = mergeEntry.stringValue.substr(sep + 1);
+                description = mergeEntry.stringValue;
             }
-            std::size_t sep = mergeEntry.stringValue.find(' ');
-            if (sep == std::string::npos)
+            else if (mergeEntry.type == JsonType::Array && mergeEntry.arrayValue.size() == 2 &&
+                     mergeEntry.arrayValue[0].type == JsonType::String && mergeEntry.arrayValue[1].type == JsonType::String)
             {
-                throw std::runtime_error("campello_llm: malformed merges entry '" + mergeEntry.stringValue + "'");
+                // Newer `tokenizers` versions (confirmed against the real library,
+                // version 0.22.2) serialize each merge as a 2-element [left, right]
+                // array instead -- an equally real, valid shape, not a guess.
+                left = mergeEntry.arrayValue[0].stringValue;
+                right = mergeEntry.arrayValue[1].stringValue;
+                description = left + " " + right;
             }
-            std::string left = mergeEntry.stringValue.substr(0, sep);
-            std::string right = mergeEntry.stringValue.substr(sep + 1);
+            else
+            {
+                throw std::runtime_error(
+                    "campello_llm: unsupported merges entry shape (expected a string or a 2-element string array)");
+            }
             auto leftIt = tokenizer->tokenToId_.find(left);
             auto rightIt = tokenizer->tokenToId_.find(right);
             auto mergedIt = tokenizer->tokenToId_.find(left + right);
             if (leftIt == tokenizer->tokenToId_.end() || rightIt == tokenizer->tokenToId_.end() ||
                 mergedIt == tokenizer->tokenToId_.end())
             {
-                throw std::runtime_error("campello_llm: merges entry '" + mergeEntry.stringValue +
+                throw std::runtime_error("campello_llm: merges entry '" + description +
                                           "' references a token missing from vocab");
             }
             tokenizer->mergeRank_[pairKey(leftIt->second, rightIt->second)] = {
