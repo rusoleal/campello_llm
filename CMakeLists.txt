@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_llm VERSION 0.1.0)
+project(campello_llm VERSION 0.2.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,10 +15,8 @@ configure_file(src/campello_llm_config.h.in campello_llm_config.h)
 
 # ---------------------------------------------------------------------------
 # campello_nn — the compute-graph library this project builds on top of.
-# campello_nn has no tags yet, so this pins to a known-good commit; move to a
-# real tag once campello_nn cuts one. campello_nn itself selects the right
-# backend (CPU/MPSGraph/DirectML/...) per-platform internally, so no
-# per-platform .cmake files are needed here.
+# campello_nn itself selects the right backend (CPU/MPSGraph/DirectML/...)
+# per-platform internally, so no per-platform .cmake files are needed here.
 #
 # campello_nn's own CMakeLists.txt declares `option(BUILD_TESTS ...)` and
 # `option(BUILD_EXAMPLES ...)` with the same names as ours — force both off
@@ -36,7 +34,7 @@ set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     campello_nn
     GIT_REPOSITORY https://github.com/rusoleal/campello_nn.git
-    GIT_TAG 95a8c01b586c854da6c4613a6f6cab6a69be8c28
+    GIT_TAG v0.4.0
 )
 FetchContent_MakeAvailable(campello_nn)
 

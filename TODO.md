@@ -21,8 +21,8 @@ KV-cache → generate tokens → polish/document.
 ## Phase 0 — Project Scaffolding
 
 - [x] `CMakeLists.txt` (single, no per-platform files) — `FetchContent` for `campello_nn`
-      (`https://github.com/rusoleal/campello_nn.git`, pinned commit — no tags exist upstream yet)
-      and GoogleTest, mirroring `campello_nn`'s own FetchContent conventions
+      (`https://github.com/rusoleal/campello_nn.git`, pinned to version tag) and GoogleTest,
+      mirroring `campello_nn`'s own FetchContent conventions
 - [x] Directory layout: `include/campello_llm/`, `src/`, `tests/` — mirror `campello_nn`'s
       `inc`/`src`/`tests` split. Handle-based public-API convention deferred to Phase 3 once
       `Model`'s actual shape is known
@@ -237,6 +237,50 @@ reference/example backend.
       supply, how to add a conformance/determinism test for it)
 - [ ] Versioning/compatibility notes for any cached-graph files this project produces (inherits
       `campello_nn`'s own graph-cache versioning, see that project's `TODO.md` Phase 4c)
+
+---
+
+## Phase 8 — Memory-Efficient Weight Loading (mmap + streaming binds)
+
+Goal: eliminate the memory spike `Model::load()` currently has — the raw weights file fully
+resident in one heap buffer *at the same time* the graph's decoded/transposed F32 copy is being
+built up tensor by tensor — which makes loading a real multi-gigabyte checkpoint (7B+ params)
+infeasible on memory-constrained machines even when the *final* resident weight size alone would
+fit. Root cause: `SafetensorsFile`/`GgufFile`'s `loadXFromFile()` eagerly `read()`s the entire file
+into one owned buffer before any tensor is transformed (Phase 1's "one owned buffer per file" design
+— see `CLAUDE.md`); `constantWeight()`/`constantLinearWeightTransposed()` already process tensors
+one at a time, but that raw whole-file buffer sits resident throughout regardless.
+
+- [ ] **Replace the eager whole-file heap read in `loadSafetensorsFromFile()` (and later
+      `loadGgufFromFile()`) with a read-only memory mapping** (POSIX `mmap()`/Windows
+      `MapViewOfFile()`, behind a small `#ifdef`-guarded helper in one translation unit — a
+      code-level `#ifdef`, not a per-platform `.cmake` file, so this doesn't violate the "Platform
+      Independence" rule in `CLAUDE.md`). Mapped, file-backed pages are reclaimable by the OS under
+      memory pressure without ever being swapped, unlike a heap buffer holding the same bytes — this
+      is what actually removes the raw copy from the peak. `loadXFromMemory()` and the
+      Android/`AAssetManager`-facing path are unaffected — no real file path exists to map there, and
+      they keep working exactly as today.
+- [ ] `TensorInfo::data` becomes a view into the mapped region instead of the heap buffer;
+      `WeightsFile`'s owning object keeps the mapping (and underlying file handle) alive for its own
+      lifetime and unmaps/closes it in its destructor — same ownership shape as today, just a
+      different backing store.
+- [ ] Audit `constantWeight()`/`constantLinearWeightTransposed()` (`weight_loading.cpp`) to confirm
+      — and add a regression test asserting — that binding stays strictly one-tensor-at-a-time (decode
+      into a transient buffer, bind via `GraphBuilder::constant()`, let the transient buffer go out
+      of scope, move to the next tensor) so a future change doesn't accidentally reintroduce a
+      whole-model-sized transform buffer once the raw-side fix above lands.
+- [ ] Test/benchmark: some proxy for "peak extra memory during `Model::load()` is O(one tensor),
+      not O(whole model)" — OS-level RSS isn't portable, so this likely needs a custom
+      allocation-counting harness rather than a real RSS measurement. Exact mechanism still open.
+- [ ] Re-run the real-TinyLlama end-to-end attempt (Phase 6 note above) after the mmap switch to
+      confirm it's a pure memory-strategy change with no behavioral difference (same tensors, same
+      bytes, same decode).
+- [ ] **Open question, cross-repo:** `campello_nn`'s `GraphBuilder::constant()` always copies its
+      input into the graph's own storage by design, so the *final* resident size (decoded F32,
+      transposed) is unavoidable from `campello_llm`'s side no matter what — mmap removes the raw
+      *source* copy from the peak, it does not shrink the final footprint itself. A graph that stays
+      BF16-resident end-to-end (skipping the F32 expansion entirely) would need a `campello_nn`-side
+      change, not something fixable here.
 
 ---
 

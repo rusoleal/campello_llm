@@ -33,12 +33,11 @@ needs different behavior, that belongs in `campello_nn`, not here.
 
 ### Dependency on campello_nn
 
-Fetched via `FetchContent` in the top-level `CMakeLists.txt`, pinned to a commit SHA (no tags exist
-yet upstream — move to a real tag once `campello_nn` cuts one). `campello_nn`'s own
-`CMakeLists.txt` declares an `option(BUILD_TESTS ...)` with the same name as ours; the top-level
-`CMakeLists.txt` forces it off around the `FetchContent_MakeAvailable(campello_nn)` call so a
-`-DBUILD_TESTS=ON` meant for `campello_llm`'s own tests doesn't also build (and run, via `ctest`)
-`campello_nn`'s universal test suite — that suite's fixture paths resolve against
+Fetched via `FetchContent` in the top-level `CMakeLists.txt`, pinned to a version tag.
+`campello_nn`'s own `CMakeLists.txt` declares an `option(BUILD_TESTS ...)` with the same name as
+ours; the top-level `CMakeLists.txt` forces it off around the `FetchContent_MakeAvailable(campello_nn)`
+call so a `-DBUILD_TESTS=ON` meant for `campello_llm`'s own tests doesn't also build (and run, via
+`ctest`) `campello_nn`'s universal test suite — that suite's fixture paths resolve against
 `CMAKE_SOURCE_DIR`, which becomes *this* project's source tree once it's pulled in as a
 subdirectory, so its tests fail for reasons that have nothing to do with `campello_llm`. Don't
 remove that guard without re-checking that case.

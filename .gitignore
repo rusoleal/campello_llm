@@ -1,2 +1,5 @@
 build/
 .DS_Store
+
+# Generated graph-cache files produced by Model::load() / the CLI example.
+*.cache
