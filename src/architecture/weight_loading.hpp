@@ -41,6 +41,37 @@ namespace systems::leal::campello_llm::internal
                                                  const std::string &name, std::int64_t outDim, std::int64_t inDim);
 
     /**
+     * @brief Description of a loaded linear weight, which may be either a plain
+     * Float32 constant (legacy path) or a raw GGML block-quantized constant.
+     */
+    struct LinearWeight
+    {
+        cnn::Operand operand;
+        bool isQuantized = false;
+        std::int32_t ggmlQuantType = 0; // GGML quantization type enum value (e.g. 12 for Q4_K)
+    };
+
+    /**
+     * @brief Loads an `[outDim, inDim]` PyTorch `nn.Linear`-style weight for use with
+     * `applyLinear()`. If the weight is F32/F16/BF16 it is decoded and transposed
+     * host-side to `[inDim, outDim]` and `isQuantized` is false. If it is a supported
+     * GGML block-quantized type (Q4_0, Q8_0, Q4_K, etc.), the raw quantized bytes are
+     * bound as an Int8 constant and `isQuantized` is true with the GGML type stored
+     * in `ggmlQuantType`.
+     * @throws std::runtime_error if missing, an unsupported dtype, or shape-mismatched.
+     */
+    LinearWeight loadLinearWeight(cnn::GraphBuilder &builder, const WeightsFile &weights,
+                                   const std::string &name, std::int64_t outDim, std::int64_t inDim);
+
+    /**
+     * @brief Applies a `LinearWeight` to `input` (shape [..., M, inDim]), returning
+     * [..., M, outDim]. Uses `matmul()` for Float32 weights and `ggmlQuantizedMatmul()`
+     * for raw GGML quantized weights.
+     */
+    cnn::Operand applyLinear(cnn::GraphBuilder &builder, cnn::Operand input, const LinearWeight &weight,
+                              std::int64_t outDim, std::int64_t inDim);
+
+    /**
      * @brief A rank-1 `[1]` Float32 constant holding `value` (for scale factors etc.,
      * relying on `mul()`/`add()`'s NumPy-style broadcasting).
      */

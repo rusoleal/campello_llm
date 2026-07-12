@@ -10,7 +10,7 @@ TEST(Smoke, VersionIsSet)
 {
     auto v = version();
     EXPECT_EQ(v.major, 0u);
-    EXPECT_EQ(v.minor, 2u);
+    EXPECT_EQ(v.minor, 3u);
     EXPECT_EQ(v.patch, 0u);
 }
 

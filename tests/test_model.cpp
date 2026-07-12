@@ -127,6 +127,24 @@ TEST(Model, LoadThrowsOnMissingDirectory)
     EXPECT_THROW(Model::load(context, fixtureDir() + "_does_not_exist", 8), std::runtime_error);
 }
 
+TEST(Model, LoadsGgufFileAndGenerates)
+{
+    std::string ggufPath = std::string(CAMPELLO_LLM_TEST_FIXTURES_DIR) + "/tiny_gguf_model.gguf";
+    auto context = cnn::Context::create({cnn::DeviceType::Cpu});
+    auto model = Model::load(context, ggufPath, 8);
+
+    GenerationConfig config;
+    config.maxTokens = 3;
+    config.temperature = 0.0f; // greedy
+
+    // The tiny network's weights are random; this just confirms the full GGUF
+    // pipeline (metadata config + embedded tokenizer + name/shape adapter +
+    // dequantization + graph build + generate loop) runs end-to-end.
+    std::string generated = model->generate("hi", config);
+    SUCCEED();
+    (void)generated;
+}
+
 // Model::load() automatically caches its compiled decode graph as a sibling file
 // of model.safetensors (CLAUDE.md/TODO.md Phase 4) -- maxSequenceLength=10 here is
 // unused by any other test in this file, so this test's cache file can't collide
@@ -154,6 +172,62 @@ TEST(Model, GraphCacheRoundTripProducesIdenticalOutput)
     std::string outputB = modelB->generate("hi", config);
 
     EXPECT_EQ(outputA, outputB);
+}
+
+// Model::generate()'s KV-cache/decode-graph capacity starts small (256, see
+// model.cpp's kInitialKvCacheCapacity) and doubles as the conversation grows,
+// rebuilding the compiled decode graph on each doubling -- this exercises that
+// growth actually happening (maxSequenceLength=400 forces a 256->400 regrowth
+// partway through generation) both for crash/corruption-freedom and for the
+// invariant that growing later must not change any token decided before the
+// growth boundary: a model capped at exactly 256 (which never grows) must
+// produce the same greedy tokens, for as long as it runs, as the prefix of a
+// model that keeps going and grows past it.
+TEST(Model, KvCacheGrowsAcrossCapacityBoundaryWithoutCorruption)
+{
+    // Comparing decoded text directly (rather than truncating a longer decoded
+    // string by byte count) sidesteps onToken's byte-fallback merging -- a single
+    // callback can cover more than one generated token, so a byte-offset cut
+    // could land mid-token. Capping accumulation at the same *callback* count on
+    // both sides is safe because that count is itself a deterministic function of
+    // the (assumed identical, for a correct implementation) shared token prefix.
+    constexpr int kPrefixChunks = 20;
+
+    GenerationConfig shortConfig;
+    shortConfig.maxTokens = 20;
+    shortConfig.temperature = 0.0f;
+
+    auto shortModel = loadTinyModel(256);
+    std::string shortOutput = shortModel->generate("hi", shortConfig);
+
+    GenerationConfig longConfig;
+    longConfig.maxTokens = 280; // prompt (~3 ids incl. BOS) + this comfortably crosses position 256
+    longConfig.temperature = 0.0f;
+
+    auto growingModelA = loadTinyModel(400);
+    int chunksA = 0;
+    std::string longPrefixA;
+    std::string longOutputA = growingModelA->generate("hi", longConfig, [&](const std::string &chunk) {
+        if (chunksA < kPrefixChunks)
+        {
+            longPrefixA += chunk;
+            ++chunksA;
+        }
+    });
+
+    // Determinism across two independent instances that both grow: if the
+    // capacity-doubling cache copy were misaligned, the corrupted (effectively
+    // uninitialized-heap-dependent) values would make this an unreliable EXPECT_EQ.
+    auto growingModelB = loadTinyModel(400);
+    std::string longOutputB = growingModelB->generate("hi", longConfig);
+    EXPECT_EQ(longOutputA, longOutputB);
+
+    // Growing later must not retroactively change tokens already decided before
+    // the 256-boundary: the never-grows model's output must match the growing
+    // model's first kPrefixChunks callback firings (or both must match in full, if
+    // greedy decoding/a stop condition ended either run before that many chunks).
+    std::string expectedPrefix = longPrefixA.substr(0, std::min(longPrefixA.size(), shortOutput.size()));
+    EXPECT_EQ(shortOutput, expectedPrefix);
 }
 
 TEST(Model, CorruptGraphCacheFallsBackToBuildingFresh)

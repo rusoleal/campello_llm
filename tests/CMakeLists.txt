@@ -13,11 +13,14 @@ add_executable(campello_llm_tests
     test_smoke.cpp
     test_safetensors_reader.cpp
     test_gguf_reader.cpp
+    test_gguf_dequantize.cpp
+    test_gguf_model_loader.cpp
     test_tokenizer.cpp
     test_llama_architecture.cpp
     test_gpt_architecture.cpp
     test_architecture_registry.cpp
     test_llama_config_reader.cpp
+    test_chat_template.cpp
     test_model.cpp
 )
 target_include_directories(campello_llm_tests PRIVATE

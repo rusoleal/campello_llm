@@ -33,6 +33,22 @@ namespace systems::leal::campello_llm
         U32,
         U64,
         Bool,
+        Q4_0, // GGML block-quantized: 18 bytes / 32 elements
+        Q8_0, // GGML block-quantized: 34 bytes / 32 elements
+
+        // Legacy GGML block-quantized types (32 elements per block)
+        Q4_1, // 20 bytes / 32 elements
+        Q5_0, // 22 bytes / 32 elements
+        Q5_1, // 24 bytes / 32 elements
+        Q8_1, // 36 bytes / 32 elements
+
+        // K-quant super-block types (256 elements per super-block)
+        Q2_K, // 84 bytes  / 256 elements
+        Q3_K, // 110 bytes / 256 elements
+        Q4_K, // 144 bytes / 256 elements
+        Q5_K, // 176 bytes / 256 elements
+        Q6_K, // 210 bytes / 256 elements
+        Q8_K, // 292 bytes / 256 elements
     };
 
     /**
@@ -68,8 +84,21 @@ namespace systems::leal::campello_llm
             return 8;
         case WeightDType::Bool:
             return 1;
+        case WeightDType::Q4_0:
+        case WeightDType::Q8_0:
+        case WeightDType::Q4_1:
+        case WeightDType::Q5_0:
+        case WeightDType::Q5_1:
+        case WeightDType::Q8_1:
+        case WeightDType::Q2_K:
+        case WeightDType::Q3_K:
+        case WeightDType::Q4_K:
+        case WeightDType::Q5_K:
+        case WeightDType::Q6_K:
+        case WeightDType::Q8_K:
+            break;
         }
-        throw std::runtime_error("campello_llm: unhandled WeightDType in weightDTypeSize()");
+        throw std::runtime_error("campello_llm: block-quantized dtypes have no per-element size; use block size");
     }
 
     /**

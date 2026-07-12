@@ -185,9 +185,9 @@ namespace
 
 // A hand-built single-tensor gguf file (no metadata) whose tensor type is Q4_0 —
 // a real block-quantized GGMLQuantizationType (verified against the real `gguf`
-// Python package's constants.py) that campello_llm has no dequantization path for
-// yet. Must throw rather than guess a layout for it.
-TEST(GgufReader, UnsupportedQuantizedTensorTypeThrows)
+// Python package's constants.py). The reader should expose it with WeightDType::Q4_0
+// and the correct block-based byte length (18 bytes for 32 elements).
+TEST(GgufReader, ReadsQ4_0Tensor)
 {
     std::vector<std::uint8_t> buf;
     appendLE<std::uint32_t>(buf, 0x46554747); // magic "GGUF"
@@ -201,7 +201,13 @@ TEST(GgufReader, UnsupportedQuantizedTensorTypeThrows)
     appendLE<std::uint32_t>(buf, 2);  // dtype = Q4_0
     appendLE<std::uint64_t>(buf, 0);  // relative offset
 
-    buf.resize(buf.size() + 64, 0); // padding past the (unreached) data section
+    // Pad generously past the 32-byte alignment boundary and the 18-byte tensor data.
+    buf.resize(buf.size() + 256, 0);
 
-    EXPECT_THROW(loadGgufFromMemory(buf.data(), buf.size()), std::runtime_error);
+    auto file = loadGgufFromMemory(buf.data(), buf.size());
+    const TensorInfo *t = file->find("q");
+    ASSERT_NE(t, nullptr);
+    EXPECT_EQ(t->dtype, WeightDType::Q4_0);
+    EXPECT_EQ(t->shape, (std::vector<std::int64_t>{32}));
+    EXPECT_EQ(t->byteLength, 18u);
 }

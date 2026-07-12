@@ -11,11 +11,13 @@
 #include <unordered_map>
 #include <vector>
 
+#include <campello_llm/gguf_reader.hpp>
 #include <campello_llm/safetensors_reader.hpp>
 #include <campello_llm/tokenizer_config.hpp>
 #include <campello_nn/graph_cache.hpp>
 
 #include "architecture/weight_loading.hpp"
+#include "gguf/gguf_model_loader.hpp"
 
 namespace cnn = systems::leal::campello_nn;
 namespace fs = std::filesystem;
@@ -138,17 +140,152 @@ namespace
 namespace systems::leal::campello_llm
 {
 
-    std::unique_ptr<Model> Model::load(std::shared_ptr<cnn::Context> context, const std::string &directory,
-                                        std::int64_t maxSequenceLength)
+    namespace
     {
-        if (maxSequenceLength <= 0)
+        std::int32_t eosTokenIdFromTokenizerConfig(const Tokenizer &tokenizer,
+                                                    const SpecialTokenStrings &specialTokens)
         {
-            throw std::runtime_error("campello_llm: maxSequenceLength must be positive");
+            if (!specialTokens.eosToken.empty())
+            {
+                if (auto id = tokenizer.tokenToId(specialTokens.eosToken))
+                {
+                    return *id;
+                }
+            }
+            return -1;
         }
 
+        std::int32_t eosTokenIdFromGguf(const Tokenizer &tokenizer, const GgufFile &file)
+        {
+            const GgufValue *eosId = file.findMetadata("tokenizer.ggml.eos_token_id");
+            if (eosId != nullptr && eosId->type == GgufValueType::Int32)
+            {
+                std::int32_t id = eosId->asInt32();
+                if (id >= 0 && static_cast<std::size_t>(id) < tokenizer.vocabSize())
+                {
+                    return id;
+                }
+            }
+            return -1;
+        }
+
+        std::string ggufGraphCachePath(const std::string &ggufPath, std::int64_t maxSequenceLength)
+        {
+            return ggufPath + ".campello_llm_decode_graph." + std::to_string(maxSequenceLength) + ".cache";
+        }
+
+        // The initial KV-cache/decode-graph capacity a freshly loaded Model starts at,
+        // before generate() grows it (doubling) toward maxSequenceLength as needed.
+        // Keeps `Model::load()` cheap and avoids paying for a maxSequenceLength-sized
+        // KV-cache for conversations that never get that long.
+        constexpr std::int64_t kInitialKvCacheCapacity = 256;
+
+        std::int64_t initialCapacityFor(std::int64_t maxSequenceLength)
+        {
+            return std::min<std::int64_t>(kInitialKvCacheCapacity, maxSequenceLength);
+        }
+
+        // Builds (or loads from the on-disk decode-graph cache) the compiled decode
+        // graph for a GGUF model at `capacity`. Always re-reads/re-parses the GGUF file
+        // rather than reusing a retained `GgufFile` -- buildLlamaDecodeGraph() copies
+        // every weight it binds into the graph's own constants, so keeping a second
+        // parsed copy around just to make later regrowth cheap would double the
+        // resident weight memory. This only runs when growing past a capacity that
+        // hasn't been built before (or its cache file is stale/missing).
+        ArchitectureGraphResult buildOrLoadGgufDecodeGraph(std::shared_ptr<cnn::Context> context,
+                                                            const std::string &path, const LlamaConfig &config,
+                                                            std::int64_t capacity)
+        {
+            std::string cachePath = ggufGraphCachePath(path, capacity);
+            if (isGraphCacheFresh(cachePath, path, path))
+            {
+                try
+                {
+                    cnn::GraphCacheResult cached = cnn::loadGraphFromFile(context, cachePath);
+                    ArchitectureGraphResult result;
+                    result.graph = cached.graph;
+                    result.inputs = std::move(cached.inputs);
+                    result.outputs = std::move(cached.outputs);
+                    return result;
+                }
+                catch (const std::exception &)
+                {
+                    // Corrupt/truncated/incompatible-version cache: fall back to building fresh.
+                }
+            }
+
+            auto gguf = loadGgufFromFile(path);
+            GgufWeightsAdapter weights(*gguf);
+            ArchitectureGraphResult result = buildLlamaDecodeGraph(context, weights, config, capacity);
+            try
+            {
+                cnn::saveGraphToFile(result.serializedGraph, cachePath);
+            }
+            catch (const std::exception &)
+            {
+                // Best-effort: skip caching on read-only directories.
+            }
+            // `serializedGraph` is only useful for the on-disk cache write above --
+            // ends up stored on Model::graph_ (a member with the Model's own
+            // lifetime) otherwise, retaining a full second copy of every weight byte
+            // (roughly the size of the model file itself) for as long as the model
+            // stays loaded, for no further purpose.
+            result.serializedGraph.clear();
+            result.serializedGraph.shrink_to_fit();
+            return result;
+        }
+
+        // Same as buildOrLoadGgufDecodeGraph(), for the HuggingFace safetensors layout.
+        ArchitectureGraphResult buildOrLoadSafetensorsDecodeGraph(std::shared_ptr<cnn::Context> context,
+                                                                   const std::string &directory,
+                                                                   const LlamaConfig &config, std::int64_t capacity)
+        {
+            std::string weightsPath = joinPath(directory, "model.safetensors");
+            std::string configPath = joinPath(directory, "config.json");
+            std::string cachePath = graphCachePath(directory, capacity);
+            if (isGraphCacheFresh(cachePath, weightsPath, configPath))
+            {
+                try
+                {
+                    cnn::GraphCacheResult cached = cnn::loadGraphFromFile(context, cachePath);
+                    ArchitectureGraphResult result;
+                    result.graph = cached.graph;
+                    result.inputs = std::move(cached.inputs);
+                    result.outputs = std::move(cached.outputs);
+                    return result;
+                }
+                catch (const std::exception &)
+                {
+                    // Corrupt cache: fall back to building fresh.
+                }
+            }
+
+            auto weights = loadSafetensorsFromFile(weightsPath);
+            ArchitectureGraphResult result = buildLlamaDecodeGraph(context, *weights, config, capacity);
+            try
+            {
+                cnn::saveGraphToFile(result.serializedGraph, cachePath);
+            }
+            catch (const std::exception &)
+            {
+                // Best-effort: skip caching on read-only directories.
+            }
+            // See buildOrLoadGgufDecodeGraph()'s comment: drop the now-unneeded second
+            // copy of every weight byte before this result becomes Model::graph_.
+            result.serializedGraph.clear();
+            result.serializedGraph.shrink_to_fit();
+            return result;
+        }
+    } // namespace
+
+    std::unique_ptr<Model> Model::loadFromSafetensorsDirectory(std::shared_ptr<cnn::Context> context,
+                                                                const std::string &directory,
+                                                                std::int64_t maxSequenceLength)
+    {
         LlamaConfig config = loadLlamaConfigFromFile(joinPath(directory, "config.json"));
         auto tokenizer = loadTokenizerFromFile(joinPath(directory, "tokenizer.json"));
-        SpecialTokenStrings specialTokens = loadSpecialTokenStringsFromFile(joinPath(directory, "tokenizer_config.json"));
+        SpecialTokenStrings specialTokens =
+            loadSpecialTokenStringsFromFile(joinPath(directory, "tokenizer_config.json"));
 
         auto model = std::unique_ptr<Model>(new Model());
         model->context_ = context;
@@ -159,25 +296,50 @@ namespace systems::leal::campello_llm
         model->numKeyValueHeads_ = config.numKeyValueHeads;
         model->headDim_ = config.hiddenSize / config.numAttentionHeads;
         model->ropeTheta_ = config.ropeTheta;
+        model->architectureName_ = "llama";
+        model->eosId_ = eosTokenIdFromTokenizerConfig(*model->tokenizer_, specialTokens);
 
-        if (!specialTokens.eosToken.empty())
-        {
-            if (auto id = model->tokenizer_->tokenToId(specialTokens.eosToken))
-            {
-                model->eosId_ = *id;
-            }
-        }
+        model->currentCapacity_ = initialCapacityFor(maxSequenceLength);
+        model->graph_ = buildOrLoadSafetensorsDecodeGraph(context, directory, config, model->currentCapacity_);
+        model->rebuildGraph_ = [context, directory, config](std::int64_t capacity) {
+            return buildOrLoadSafetensorsDecodeGraph(context, directory, config, capacity);
+        };
 
-        std::string weightsPath = joinPath(directory, "model.safetensors");
-        std::string configPath = joinPath(directory, "config.json");
-        std::string cachePath = graphCachePath(directory, maxSequenceLength);
+        return model;
+    }
 
+    std::unique_ptr<Model> Model::loadFromGgufFile(std::shared_ptr<cnn::Context> context,
+                                                    const std::string &path,
+                                                    std::int64_t maxSequenceLength)
+    {
+        auto gguf = loadGgufFromFile(path);
+        LlamaConfig config = loadLlamaConfigFromGgufFile(*gguf);
+        auto tokenizer = loadTokenizerFromGgufFile(*gguf);
+
+        auto model = std::unique_ptr<Model>(new Model());
+        model->context_ = context;
+        model->tokenizer_ = std::move(tokenizer);
+        model->maxSequenceLength_ = maxSequenceLength;
+        model->vocabSize_ = config.vocabSize;
+        model->numLayers_ = config.numLayers;
+        model->numKeyValueHeads_ = config.numKeyValueHeads;
+        model->headDim_ = config.hiddenSize / config.numAttentionHeads;
+        model->ropeTheta_ = config.ropeTheta;
+        model->architectureName_ = "llama";
+        model->eosId_ = eosTokenIdFromGguf(*model->tokenizer_, *gguf);
+
+        // Reuse the already-parsed `gguf` for the initial graph build (no need to
+        // re-read the file we just read above); only later regrowth, via
+        // rebuildGraph_, re-reads from disk -- see buildOrLoadGgufDecodeGraph()'s doc
+        // comment for why it doesn't retain a parsed copy for that purpose instead.
+        model->currentCapacity_ = initialCapacityFor(maxSequenceLength);
+        std::string initialCachePath = ggufGraphCachePath(path, model->currentCapacity_);
         bool loadedFromCache = false;
-        if (isGraphCacheFresh(cachePath, weightsPath, configPath))
+        if (isGraphCacheFresh(initialCachePath, path, path))
         {
             try
             {
-                cnn::GraphCacheResult cached = cnn::loadGraphFromFile(context, cachePath);
+                cnn::GraphCacheResult cached = cnn::loadGraphFromFile(context, initialCachePath);
                 model->graph_.graph = cached.graph;
                 model->graph_.inputs = std::move(cached.inputs);
                 model->graph_.outputs = std::move(cached.outputs);
@@ -185,39 +347,62 @@ namespace systems::leal::campello_llm
             }
             catch (const std::exception &)
             {
-                // Corrupt/truncated/incompatible-version cache (campello_nn's
-                // loadGraphFromFile() magic/version-checks the bytes) -- fall back to
-                // building fresh below rather than failing Model::load() over a stale
-                // or damaged cache file.
+                // Corrupt cache: fall back to building fresh.
             }
         }
-
         if (!loadedFromCache)
         {
-            // Weights only need to live long enough to bind every constant() into the
-            // graph -- buildLlamaDecodeGraph() copies every tensor's bytes immediately
-            // (see GraphBuilder::constant()), so the multi-gigabyte WeightsFile buffer
-            // can be freed right after this block instead of held for the Model's
-            // whole lifetime.
-            auto weights = loadSafetensorsFromFile(weightsPath);
-            model->graph_ = buildLlamaDecodeGraph(context, *weights, config, maxSequenceLength);
-
+            GgufWeightsAdapter weights(*gguf);
+            model->graph_ = buildLlamaDecodeGraph(context, weights, config, model->currentCapacity_);
             try
             {
-                cnn::saveGraphToFile(model->graph_.serializedGraph, cachePath);
+                cnn::saveGraphToFile(model->graph_.serializedGraph, initialCachePath);
             }
             catch (const std::exception &)
             {
-                // Best-effort: a read-only model directory shouldn't fail loading,
-                // just skip caching for next time.
+                // Best-effort: skip caching on read-only directories.
             }
+            // See buildOrLoadGgufDecodeGraph()'s comment: drop the now-unneeded second
+            // copy of every weight byte before it sits on model->graph_ indefinitely.
+            model->graph_.serializedGraph.clear();
+            model->graph_.serializedGraph.shrink_to_fit();
         }
+        model->rebuildGraph_ = [context, path, config](std::int64_t capacity) {
+            return buildOrLoadGgufDecodeGraph(context, path, config, capacity);
+        };
 
         return model;
     }
 
+    std::unique_ptr<Model> Model::load(std::shared_ptr<cnn::Context> context, const std::string &directory,
+                                        std::int64_t maxSequenceLength)
+    {
+        if (maxSequenceLength <= 0)
+        {
+            throw std::runtime_error("campello_llm: maxSequenceLength must be positive");
+        }
+
+        std::error_code ec;
+        std::filesystem::file_status status = std::filesystem::status(directory, ec);
+        if (ec || !std::filesystem::exists(status))
+        {
+            throw std::runtime_error("campello_llm: model path does not exist: '" + directory + "'");
+        }
+
+        if (std::filesystem::is_regular_file(status))
+        {
+            if (directory.size() >= 5 && directory.compare(directory.size() - 5, 5, ".gguf") == 0)
+            {
+                return loadFromGgufFile(context, directory, maxSequenceLength);
+            }
+            throw std::runtime_error("campello_llm: unsupported model file format: '" + directory + "'");
+        }
+
+        return loadFromSafetensorsDirectory(context, directory, maxSequenceLength);
+    }
+
     std::string Model::generate(const std::string &prompt, const GenerationConfig &config,
-                                 const std::function<void(const std::string &)> &onToken) const
+                                 const std::function<void(const std::string &)> &onToken)
     {
         std::vector<std::int32_t> allIds = tokenizer_->encode(prompt, true);
         if (static_cast<std::int64_t>(allIds.size()) >= maxSequenceLength_)
@@ -227,34 +412,94 @@ namespace systems::leal::campello_llm
         }
         std::size_t promptLength = allIds.size();
 
-        // Host-held KV-cache: one [numKeyValueHeads, maxSequenceLength, headDim]
-        // buffer per layer, per K/V. Zero-initialized so cache slots not yet filled
-        // contribute a deterministic (and harmless, since attn_mask masks them out
-        // regardless) value rather than uninitialized garbage.
-        std::size_t cacheElemsPerLayer =
-            static_cast<std::size_t>(numKeyValueHeads_ * maxSequenceLength_ * headDim_);
-        std::vector<std::vector<float>> kCache(static_cast<std::size_t>(numLayers_),
-                                                std::vector<float>(cacheElemsPerLayer, 0.0f));
-        std::vector<std::vector<float>> vCache(static_cast<std::size_t>(numLayers_),
-                                                std::vector<float>(cacheElemsPerLayer, 0.0f));
+        // KV-cache/tensor capacity backing this call. Starts at currentCapacity_ (a
+        // Model-lifetime high-water mark -- whatever an earlier generate() call, or
+        // Model::load() itself, already grew into) and doubles as needed, capped at
+        // maxSequenceLength_, instead of always paying for a maxSequenceLength_-sized
+        // KV-cache. `0` is a not-yet-allocated sentinel, forcing reallocateTo()'s
+        // first call to treat it as a fresh allocation rather than a regrowth.
+        std::int64_t capacity = 0;
+        std::vector<std::vector<float>> kCache(static_cast<std::size_t>(numLayers_));
+        std::vector<std::vector<float>> vCache(static_cast<std::size_t>(numLayers_));
+        std::vector<std::shared_ptr<cnn::Tensor>> kCacheInTensor(static_cast<std::size_t>(numLayers_));
+        std::vector<std::shared_ptr<cnn::Tensor>> vCacheInTensor(static_cast<std::size_t>(numLayers_));
+        std::shared_ptr<cnn::Tensor> attnMaskTensor;
+        std::vector<float> maskBuffer;
+
+        // (Re)allocates the KV-cache host buffers/device tensors and attn_mask tensor
+        // at `newCapacity`, copying forward any existing cache contents (zero-padding
+        // the newly added slots -- attn_mask masks them out regardless, same as the
+        // original zero-init). Rebuilds (or on-disk-cache-loads) the compiled decode
+        // graph too, whenever `newCapacity` differs from the Model's persisted
+        // currentCapacity_.
+        auto reallocateTo = [&](std::int64_t newCapacity) {
+            std::int64_t oldCapacity = capacity;
+
+            if (newCapacity != currentCapacity_)
+            {
+                graph_ = rebuildGraph_(newCapacity);
+                currentCapacity_ = newCapacity;
+            }
+
+            std::size_t newElemsPerLayer = static_cast<std::size_t>(numKeyValueHeads_ * newCapacity * headDim_);
+            for (std::int64_t layer = 0; layer < numLayers_; ++layer)
+            {
+                std::size_t li = static_cast<std::size_t>(layer);
+                std::vector<float> newK(newElemsPerLayer, 0.0f);
+                std::vector<float> newV(newElemsPerLayer, 0.0f);
+                if (oldCapacity > 0)
+                {
+                    for (std::int64_t h = 0; h < numKeyValueHeads_; ++h)
+                    {
+                        std::copy_n(kCache[li].begin() + static_cast<std::ptrdiff_t>(h * oldCapacity * headDim_),
+                                    static_cast<std::size_t>(oldCapacity * headDim_),
+                                    newK.begin() + static_cast<std::ptrdiff_t>(h * newCapacity * headDim_));
+                        std::copy_n(vCache[li].begin() + static_cast<std::ptrdiff_t>(h * oldCapacity * headDim_),
+                                    static_cast<std::size_t>(oldCapacity * headDim_),
+                                    newV.begin() + static_cast<std::ptrdiff_t>(h * newCapacity * headDim_));
+                    }
+                }
+                kCache[li] = std::move(newK);
+                vCache[li] = std::move(newV);
+
+                kCacheInTensor[li] = context_->createTensor(
+                    {cnn::DataType::Float32, {numKeyValueHeads_, newCapacity, headDim_}, false, true});
+                vCacheInTensor[li] = context_->createTensor(
+                    {cnn::DataType::Float32, {numKeyValueHeads_, newCapacity, headDim_}, false, true});
+            }
+
+            attnMaskTensor = context_->createTensor({cnn::DataType::Float32, {1, newCapacity + 1}, false, true});
+            maskBuffer.assign(static_cast<std::size_t>(newCapacity + 1), 0.0f);
+            capacity = newCapacity;
+        };
+
+        // Grows capacity (doubling from whatever it currently is, capped at
+        // maxSequenceLength_) until cache slot `position` fits, reallocating only when
+        // it actually needs to -- called before every dispatchStep(), so the very
+        // first call (capacity == 0) always reallocates at currentCapacity_, and every
+        // later call is a no-op unless `position` has walked past the current capacity.
+        auto ensureCapacityFor = [&](std::int64_t position) {
+            if (capacity > position)
+            {
+                return;
+            }
+            std::int64_t newCapacity = capacity > 0 ? capacity : currentCapacity_;
+            while (newCapacity <= position && newCapacity < maxSequenceLength_)
+            {
+                newCapacity *= 2;
+            }
+            reallocateTo(std::min(newCapacity, maxSequenceLength_));
+        };
 
         auto inputIdsTensor = context_->createTensor({cnn::DataType::Int32, {1}, false, true});
         auto ropeCosTensor = context_->createTensor({cnn::DataType::Float32, {1, headDim_}, false, true});
         auto ropeSinTensor = context_->createTensor({cnn::DataType::Float32, {1, headDim_}, false, true});
-        auto attnMaskTensor =
-            context_->createTensor({cnn::DataType::Float32, {1, maxSequenceLength_ + 1}, false, true});
         auto logitsTensor = context_->createTensor({cnn::DataType::Float32, {1, vocabSize_}, true, false});
 
-        std::vector<std::shared_ptr<cnn::Tensor>> kCacheInTensor(static_cast<std::size_t>(numLayers_));
-        std::vector<std::shared_ptr<cnn::Tensor>> vCacheInTensor(static_cast<std::size_t>(numLayers_));
         std::vector<std::shared_ptr<cnn::Tensor>> kNewTensor(static_cast<std::size_t>(numLayers_));
         std::vector<std::shared_ptr<cnn::Tensor>> vNewTensor(static_cast<std::size_t>(numLayers_));
         for (std::int64_t layer = 0; layer < numLayers_; ++layer)
         {
-            kCacheInTensor[static_cast<std::size_t>(layer)] = context_->createTensor(
-                {cnn::DataType::Float32, {numKeyValueHeads_, maxSequenceLength_, headDim_}, false, true});
-            vCacheInTensor[static_cast<std::size_t>(layer)] = context_->createTensor(
-                {cnn::DataType::Float32, {numKeyValueHeads_, maxSequenceLength_, headDim_}, false, true});
             kNewTensor[static_cast<std::size_t>(layer)] = context_->createTensor(
                 {cnn::DataType::Float32, {numKeyValueHeads_, 1, headDim_}, true, false});
             vNewTensor[static_cast<std::size_t>(layer)] = context_->createTensor(
@@ -263,14 +508,15 @@ namespace systems::leal::campello_llm
 
         std::vector<float> logitsBuffer(static_cast<std::size_t>(vocabSize_));
         std::vector<float> newKvBuffer(static_cast<std::size_t>(numKeyValueHeads_ * headDim_));
-        std::vector<float> maskBuffer(static_cast<std::size_t>(maxSequenceLength_ + 1));
 
         // Dispatches the decode graph for `tokenId` at absolute sequence `position`,
         // refreshing logitsBuffer with that position's predictions and folding the
         // graph's k_new/v_new outputs into kCache/vCache at slot `position` for the
         // next call -- used for every prompt token (filling the cache) and every
         // generated token alike, since there is only the one seqLen=1 graph (see
-        // CLAUDE.md / architecture.hpp's buildLlamaDecodeGraph()).
+        // CLAUDE.md / architecture.hpp's buildLlamaDecodeGraph()). Callers must call
+        // ensureCapacityFor(position) first so `capacity`/the cache tensors already
+        // fit `position`.
         auto dispatchStep = [&](std::int32_t tokenId, std::int64_t position) {
             inputIdsTensor->write(&tokenId, sizeof(tokenId));
 
@@ -278,11 +524,11 @@ namespace systems::leal::campello_llm
             ropeCosTensor->write(cosRow.data(), cosRow.size() * sizeof(float));
             ropeSinTensor->write(sinRow.data(), sinRow.size() * sizeof(float));
 
-            for (std::int64_t i = 0; i < maxSequenceLength_; ++i)
+            for (std::int64_t i = 0; i < capacity; ++i)
             {
                 maskBuffer[static_cast<std::size_t>(i)] = (i < position) ? 0.0f : -1e9f;
             }
-            maskBuffer[static_cast<std::size_t>(maxSequenceLength_)] = 0.0f; // current token always attends to itself
+            maskBuffer[static_cast<std::size_t>(capacity)] = 0.0f; // current token always attends to itself
             attnMaskTensor->write(maskBuffer.data(), maskBuffer.size() * sizeof(float));
 
             std::unordered_map<std::string, std::shared_ptr<cnn::Tensor>> inputs = {
@@ -316,7 +562,7 @@ namespace systems::leal::campello_llm
                     std::copy_n(newKvBuffer.begin() + static_cast<std::ptrdiff_t>(h * headDim_),
                                 static_cast<std::size_t>(headDim_),
                                 kCache[li].begin() +
-                                    static_cast<std::ptrdiff_t>(h * maxSequenceLength_ * headDim_ + position * headDim_));
+                                    static_cast<std::ptrdiff_t>(h * capacity * headDim_ + position * headDim_));
                 }
                 vNewTensor[li]->read(newKvBuffer.data(), newKvBuffer.size() * sizeof(float));
                 for (std::int64_t h = 0; h < numKeyValueHeads_; ++h)
@@ -324,7 +570,7 @@ namespace systems::leal::campello_llm
                     std::copy_n(newKvBuffer.begin() + static_cast<std::ptrdiff_t>(h * headDim_),
                                 static_cast<std::size_t>(headDim_),
                                 vCache[li].begin() +
-                                    static_cast<std::ptrdiff_t>(h * maxSequenceLength_ * headDim_ + position * headDim_));
+                                    static_cast<std::ptrdiff_t>(h * capacity * headDim_ + position * headDim_));
                 }
             }
         };
@@ -334,6 +580,7 @@ namespace systems::leal::campello_llm
         // prompt, ready for phase B's first sample.
         for (std::int64_t pos = 0; pos < static_cast<std::int64_t>(promptLength); ++pos)
         {
+            ensureCapacityFor(pos);
             dispatchStep(allIds[static_cast<std::size_t>(pos)], pos);
         }
 
@@ -374,6 +621,7 @@ namespace systems::leal::campello_llm
                 break;
             }
 
+            ensureCapacityFor(nextPos);
             dispatchStep(nextId, nextPos);
             ++nextPos;
         }

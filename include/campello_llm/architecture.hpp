@@ -69,6 +69,22 @@ namespace systems::leal::campello_llm
      */
     LlamaConfig loadLlamaConfigFromFile(const std::string &path);
 
+    class GgufFile; // Forward declaration for the GGUF config reader below.
+
+    /**
+     * @brief Parses a `LlamaConfig` from GGUF metadata keys (`llama.block_count`,
+     * `llama.embedding_length`, etc.).
+     *
+     * `numKeyValueHeads` defaults to `numAttentionHeads` if `llama.attention.head_count_kv`
+     * is absent; `ropeTheta` defaults to `10000.0` if `llama.rope.freq_base` is absent.
+     * `vocabSize` is read from `llama.vocab_size` if present, otherwise derived from the
+     * `token_embd.weight` tensor shape.
+     * @throws std::runtime_error if `general.architecture` is not `"llama"`, a required
+     * metadata key is missing, or the file has no `token_embd.weight` tensor when
+     * `llama.vocab_size` is absent.
+     */
+    LlamaConfig loadLlamaConfigFromGgufFile(const GgufFile &file);
+
     /**
      * @brief Hyperparameters for a GPT-2-family decoder-only model — deliberately
      * structurally different from `LlamaConfig` (LayerNorm not RMSNorm, GELU not

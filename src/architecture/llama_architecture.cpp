@@ -64,16 +64,16 @@ namespace systems::leal::campello_llm
                 constantWeight(builder, weights, layerWeight(layer, "input_layernorm.weight"), {config.hiddenSize});
             cnn::Operand normed = builder.rmsNorm(hidden, attnNormWeight, config.rmsNormEps);
 
-            cnn::Operand qWeight = constantLinearWeightTransposed(
+            LinearWeight qWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.q_proj.weight"), config.hiddenSize, config.hiddenSize);
-            cnn::Operand kWeight = constantLinearWeightTransposed(
+            LinearWeight kWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.k_proj.weight"), kvDim, config.hiddenSize);
-            cnn::Operand vWeight = constantLinearWeightTransposed(
+            LinearWeight vWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.v_proj.weight"), kvDim, config.hiddenSize);
 
-            cnn::Operand q = builder.matmul(normed, qWeight); // [seqLen, hiddenSize]
-            cnn::Operand k = builder.matmul(normed, kWeight); // [seqLen, kvDim]
-            cnn::Operand v = builder.matmul(normed, vWeight); // [seqLen, kvDim]
+            cnn::Operand q = applyLinear(builder, normed, qWeight, config.hiddenSize, config.hiddenSize); // [seqLen, hiddenSize]
+            cnn::Operand k = applyLinear(builder, normed, kWeight, kvDim, config.hiddenSize); // [seqLen, kvDim]
+            cnn::Operand v = applyLinear(builder, normed, vWeight, kvDim, config.hiddenSize); // [seqLen, kvDim]
 
             q = builder.transpose(builder.reshape(q, {seqLen, config.numAttentionHeads, headDim}), {1, 0, 2});
             k = builder.transpose(builder.reshape(k, {seqLen, config.numKeyValueHeads, headDim}), {1, 0, 2});
@@ -96,27 +96,27 @@ namespace systems::leal::campello_llm
             ctx = builder.transpose(ctx, {1, 0, 2});                              // [seqLen, numAttentionHeads, headDim]
             ctx = builder.reshape(ctx, {seqLen, config.hiddenSize});              // [seqLen, hiddenSize]
 
-            cnn::Operand oWeight = constantLinearWeightTransposed(
+            LinearWeight oWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.o_proj.weight"), config.hiddenSize, config.hiddenSize);
-            cnn::Operand attnOut = builder.matmul(ctx, oWeight);
+            cnn::Operand attnOut = applyLinear(builder, ctx, oWeight, config.hiddenSize, config.hiddenSize);
             hidden = builder.add(hidden, attnOut); // residual 1
 
             cnn::Operand ffnNormWeight = constantWeight(
                 builder, weights, layerWeight(layer, "post_attention_layernorm.weight"), {config.hiddenSize});
             cnn::Operand normed2 = builder.rmsNorm(hidden, ffnNormWeight, config.rmsNormEps);
 
-            cnn::Operand gateWeight = constantLinearWeightTransposed(
+            LinearWeight gateWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "mlp.gate_proj.weight"), config.intermediateSize, config.hiddenSize);
-            cnn::Operand upWeight = constantLinearWeightTransposed(
+            LinearWeight upWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "mlp.up_proj.weight"), config.intermediateSize, config.hiddenSize);
-            cnn::Operand downWeight = constantLinearWeightTransposed(
+            LinearWeight downWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "mlp.down_proj.weight"), config.hiddenSize, config.intermediateSize);
 
-            cnn::Operand gate = builder.matmul(normed2, gateWeight);
-            cnn::Operand up = builder.matmul(normed2, upWeight);
+            cnn::Operand gate = applyLinear(builder, normed2, gateWeight, config.intermediateSize, config.hiddenSize);
+            cnn::Operand up = applyLinear(builder, normed2, upWeight, config.intermediateSize, config.hiddenSize);
             cnn::Operand silu = builder.mul(gate, builder.sigmoid(gate)); // SiLU(gate) = gate * sigmoid(gate)
             cnn::Operand ffnHidden = builder.mul(silu, up);
-            cnn::Operand down = builder.matmul(ffnHidden, downWeight);
+            cnn::Operand down = applyLinear(builder, ffnHidden, downWeight, config.hiddenSize, config.intermediateSize);
 
             hidden = builder.add(hidden, down); // residual 2
         }
@@ -124,14 +124,15 @@ namespace systems::leal::campello_llm
         cnn::Operand finalNormWeight = constantWeight(builder, weights, "model.norm.weight", {config.hiddenSize});
         hidden = builder.rmsNorm(hidden, finalNormWeight, config.rmsNormEps);
 
-        cnn::Operand lmHeadWeight =
-            constantLinearWeightTransposed(builder, weights, "lm_head.weight", config.vocabSize, config.hiddenSize);
-        cnn::Operand logits = builder.matmul(hidden, lmHeadWeight); // [seqLen, vocabSize]
+        LinearWeight lmHeadWeight =
+            loadLinearWeight(builder, weights, "lm_head.weight", config.vocabSize, config.hiddenSize);
+        cnn::Operand logits = applyLinear(builder, hidden, lmHeadWeight, config.vocabSize, config.hiddenSize); // [seqLen, vocabSize]
 
         std::unordered_map<std::string, cnn::Operand> outputOperands = {{"logits", logits}};
         ArchitectureGraphResult result;
-        result.graph = builder.build(outputOperands);
+        // serialize() before build() -- see buildLlamaDecodeGraph()'s matching comment.
         result.serializedGraph = builder.serialize(outputOperands);
+        result.graph = builder.build(outputOperands);
         result.inputs["input_ids"] = {cnn::DataType::Int32, {seqLen}, false, true};
         result.outputs["logits"] = {cnn::DataType::Float32, {seqLen, config.vocabSize}, true, false};
         return result;
@@ -172,18 +173,18 @@ namespace systems::leal::campello_llm
                 constantWeight(builder, weights, layerWeight(layer, "input_layernorm.weight"), {config.hiddenSize});
             cnn::Operand normed = builder.rmsNorm(hidden, attnNormWeight, config.rmsNormEps);
 
-            cnn::Operand qWeight = constantLinearWeightTransposed(
+            LinearWeight qWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.q_proj.weight"), config.hiddenSize, config.hiddenSize);
-            cnn::Operand kWeight = constantLinearWeightTransposed(
+            LinearWeight kWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.k_proj.weight"),
                 config.numKeyValueHeads * headDim, config.hiddenSize);
-            cnn::Operand vWeight = constantLinearWeightTransposed(
+            LinearWeight vWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.v_proj.weight"),
                 config.numKeyValueHeads * headDim, config.hiddenSize);
 
-            cnn::Operand q = builder.matmul(normed, qWeight); // [1, hiddenSize]
-            cnn::Operand kNew = builder.matmul(normed, kWeight); // [1, kvDim]
-            cnn::Operand vNew = builder.matmul(normed, vWeight); // [1, kvDim]
+            cnn::Operand q = applyLinear(builder, normed, qWeight, config.hiddenSize, config.hiddenSize); // [1, hiddenSize]
+            cnn::Operand kNew = applyLinear(builder, normed, kWeight, config.numKeyValueHeads * headDim, config.hiddenSize); // [1, kvDim]
+            cnn::Operand vNew = applyLinear(builder, normed, vWeight, config.numKeyValueHeads * headDim, config.hiddenSize); // [1, kvDim]
 
             q = builder.transpose(builder.reshape(q, {1, config.numAttentionHeads, headDim}), {1, 0, 2});
             kNew = builder.transpose(builder.reshape(kNew, {1, config.numKeyValueHeads, headDim}), {1, 0, 2});
@@ -204,41 +205,64 @@ namespace systems::leal::campello_llm
             cnn::Operand kFull = builder.concat({kCacheIn, kNew}, 1); // [numKeyValueHeads, maxSequenceLength+1, headDim]
             cnn::Operand vFull = builder.concat({vCacheIn, vNew}, 1);
 
-            kFull = repeatKvHeads(builder, kFull, config.numKeyValueHeads, groupSize, cacheAndCurrentLen, headDim);
-            vFull = repeatKvHeads(builder, vFull, config.numKeyValueHeads, groupSize, cacheAndCurrentLen, headDim);
-            // kFull, vFull are now [numAttentionHeads, maxSequenceLength+1, headDim]
+            // GqaMatMul (Cpu/GpuGeneric only, see its doc comment) reads kFull/
+            // vFull directly at their compact [numKeyValueHeads, ...] shape --
+            // every attention head indexes its shared kv head internally, so K/V
+            // never get physically replicated up to [numAttentionHeads, ...] the
+            // way repeatKvHeads()'s slice()+concat() below does. That replication,
+            // materialized per layer at the model's full (capped) context length,
+            // is what was driving GpuGeneric's memory usage far above Ollama's for
+            // the same GGUF model (see the memory-parity investigation) — MPSGraph/
+            // DirectML don't implement GqaMatMul, so they keep the old path.
+            cnn::Operand ctx;
+            if (context->deviceType() == cnn::DeviceType::Cpu || context->deviceType() == cnn::DeviceType::GpuGeneric)
+            {
+                cnn::Operand scores = builder.gqaMatMul(q, kFull, true); // [numAttentionHeads, 1, maxSequenceLength+1]
+                scores = builder.mul(scores, attnScale);
+                scores = builder.add(scores, attnMask);
+                cnn::Operand probs = builder.softmax(scores, -1);
+                ctx = builder.gqaMatMul(probs, vFull, false); // [numAttentionHeads, 1, headDim]
+            }
+            else
+            {
+                cnn::Operand kFullRepeated =
+                    repeatKvHeads(builder, kFull, config.numKeyValueHeads, groupSize, cacheAndCurrentLen, headDim);
+                cnn::Operand vFullRepeated =
+                    repeatKvHeads(builder, vFull, config.numKeyValueHeads, groupSize, cacheAndCurrentLen, headDim);
+                // kFullRepeated, vFullRepeated are now [numAttentionHeads, maxSequenceLength+1, headDim]
 
-            cnn::Operand kT = builder.transpose(kFull, {0, 2, 1}); // [numAttentionHeads, headDim, maxSequenceLength+1]
-            cnn::Operand scores = builder.matmul(q, kT);           // [numAttentionHeads, 1, maxSequenceLength+1]
-            scores = builder.mul(scores, attnScale);
-            scores = builder.add(scores, attnMask);
-            cnn::Operand probs = builder.softmax(scores, -1);
-            cnn::Operand ctx = builder.matmul(probs, vFull); // [numAttentionHeads, 1, headDim]
+                cnn::Operand kT = builder.transpose(kFullRepeated, {0, 2, 1}); // [numAttentionHeads, headDim, maxSequenceLength+1]
+                cnn::Operand scores = builder.matmul(q, kT);                  // [numAttentionHeads, 1, maxSequenceLength+1]
+                scores = builder.mul(scores, attnScale);
+                scores = builder.add(scores, attnMask);
+                cnn::Operand probs = builder.softmax(scores, -1);
+                ctx = builder.matmul(probs, vFullRepeated); // [numAttentionHeads, 1, headDim]
+            }
 
             ctx = builder.transpose(ctx, {1, 0, 2});                 // [1, numAttentionHeads, headDim]
             ctx = builder.reshape(ctx, {1, config.hiddenSize});      // [1, hiddenSize]
 
-            cnn::Operand oWeight = constantLinearWeightTransposed(
+            LinearWeight oWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "self_attn.o_proj.weight"), config.hiddenSize, config.hiddenSize);
-            cnn::Operand attnOut = builder.matmul(ctx, oWeight);
+            cnn::Operand attnOut = applyLinear(builder, ctx, oWeight, config.hiddenSize, config.hiddenSize);
             hidden = builder.add(hidden, attnOut); // residual 1
 
             cnn::Operand ffnNormWeight = constantWeight(
                 builder, weights, layerWeight(layer, "post_attention_layernorm.weight"), {config.hiddenSize});
             cnn::Operand normed2 = builder.rmsNorm(hidden, ffnNormWeight, config.rmsNormEps);
 
-            cnn::Operand gateWeight = constantLinearWeightTransposed(
+            LinearWeight gateWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "mlp.gate_proj.weight"), config.intermediateSize, config.hiddenSize);
-            cnn::Operand upWeight = constantLinearWeightTransposed(
+            LinearWeight upWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "mlp.up_proj.weight"), config.intermediateSize, config.hiddenSize);
-            cnn::Operand downWeight = constantLinearWeightTransposed(
+            LinearWeight downWeight = loadLinearWeight(
                 builder, weights, layerWeight(layer, "mlp.down_proj.weight"), config.hiddenSize, config.intermediateSize);
 
-            cnn::Operand gate = builder.matmul(normed2, gateWeight);
-            cnn::Operand up = builder.matmul(normed2, upWeight);
+            cnn::Operand gate = applyLinear(builder, normed2, gateWeight, config.intermediateSize, config.hiddenSize);
+            cnn::Operand up = applyLinear(builder, normed2, upWeight, config.intermediateSize, config.hiddenSize);
             cnn::Operand silu = builder.mul(gate, builder.sigmoid(gate)); // SiLU(gate) = gate * sigmoid(gate)
             cnn::Operand ffnHidden = builder.mul(silu, up);
-            cnn::Operand down = builder.matmul(ffnHidden, downWeight);
+            cnn::Operand down = applyLinear(builder, ffnHidden, downWeight, config.hiddenSize, config.intermediateSize);
 
             hidden = builder.add(hidden, down); // residual 2
         }
@@ -246,14 +270,21 @@ namespace systems::leal::campello_llm
         cnn::Operand finalNormWeight = constantWeight(builder, weights, "model.norm.weight", {config.hiddenSize});
         hidden = builder.rmsNorm(hidden, finalNormWeight, config.rmsNormEps);
 
-        cnn::Operand lmHeadWeight =
-            constantLinearWeightTransposed(builder, weights, "lm_head.weight", config.vocabSize, config.hiddenSize);
-        cnn::Operand logits = builder.matmul(hidden, lmHeadWeight); // [1, vocabSize]
+        LinearWeight lmHeadWeight =
+            loadLinearWeight(builder, weights, "lm_head.weight", config.vocabSize, config.hiddenSize);
+        cnn::Operand logits = applyLinear(builder, hidden, lmHeadWeight, config.vocabSize, config.hiddenSize); // [1, vocabSize]
         outputs["logits"] = logits;
 
         ArchitectureGraphResult result;
-        result.graph = builder.build(outputs);
+        // serialize() before build(): GraphBuilder::build() now moves (rather
+        // than copies) the builder's internal IR into the compiled graph, to
+        // avoid deep-copying every weight's raw bytes yet again on top of the
+        // copies already made while the graph was being built (see
+        // campello_nn's Backend::compileGraph() doc comment) -- so it must run
+        // last, after anything else (like serialize(), for the graph cache
+        // file) that still needs the builder's IR intact.
         result.serializedGraph = builder.serialize(outputs);
+        result.graph = builder.build(outputs);
         result.inputs["input_ids"] = {cnn::DataType::Int32, {1}, false, true};
         result.inputs["rope_cos"] = {cnn::DataType::Float32, {1, headDim}, false, true};
         result.inputs["rope_sin"] = {cnn::DataType::Float32, {1, headDim}, false, true};

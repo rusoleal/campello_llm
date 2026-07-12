@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.22.1)
 
-project(campello_llm VERSION 0.2.0)
+project(campello_llm VERSION 0.3.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -34,7 +34,7 @@ set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     campello_nn
     GIT_REPOSITORY https://github.com/rusoleal/campello_nn.git
-    GIT_TAG v0.4.0
+    GIT_TAG v0.5.0
 )
 FetchContent_MakeAvailable(campello_nn)
 
@@ -49,6 +49,8 @@ set(CAMPELLO_LLM_CORE_SOURCES
     src/json/json_value.cpp
     src/safetensors/safetensors_reader.cpp
     src/gguf/gguf_reader.cpp
+    src/gguf/gguf_dequantize.cpp
+    src/gguf/gguf_model_loader.cpp
     src/tokenizer/tokenizer.cpp
     src/tokenizer/tokenizer_config.cpp
     src/architecture/weight_loading.cpp
@@ -56,6 +58,7 @@ set(CAMPELLO_LLM_CORE_SOURCES
     src/architecture/gpt_architecture.cpp
     src/architecture/architecture_registry.cpp
     src/architecture/llama_config_reader.cpp
+    src/chat_template/chat_template.cpp
     src/model.cpp
 )
 

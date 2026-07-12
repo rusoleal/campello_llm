@@ -69,11 +69,10 @@ actually ships.
 - [x] Tokenizer support for one format first — HuggingFace `tokenizer.json` BPE, specifically the
       SentencePiece-style byte-fallback variant LLaMA/TinyLlama ships (see `CLAUDE.md` for the exact
       supported normalizer/decoder/post_processor shapes; other shapes, e.g. GPT-2/Llama-3's
-      `ByteLevel` pre_tokenizer, throw rather than silently mistokenizing). **Not yet done:** a
-      `GgufFile` -> `Tokenizer` adapter for gguf's embedded `tokenizer.ggml.tokens`/`merges`
-      metadata (a different on-disk representation of the same vocab/merges data Phase 1's gguf
-      reader already exposes generically) — left for whenever the second, gguf-format target model
-      (see `TODO.md` Open Questions) is actually wired up.
+      `ByteLevel` pre_tokenizer, throw rather than silently mistokenizing).
+- [x] GGUF embedded tokenizer adapter — `loadTokenizerFromGgufFile()` builds a `Tokenizer` from
+      `tokenizer.ggml.tokens`/`merges`/token-id metadata (a different on-disk representation of the
+      same vocab/merges data Phase 1's gguf reader already exposes generically).
 - [x] Encode: text → token ids (BPE merge algorithm, with byte-fallback and literal added-token
       recognition — e.g. `</s>` in raw input is recognized as id 2, not BPE'd character-by-character)
 - [x] Decode: token ids → text (full decoder chain: `Replace`/`ByteFallback`/`Fuse`/`Strip`)
@@ -82,7 +81,13 @@ actually ships.
       reader (`tokenizer_config.hpp`) resolves those by token *text*, then `Tokenizer::tokenToId()`
       resolves the id — and basic chat template handling (`formatSingleTurnChatPrompt()`, the
       literal `"<|role|>\n{content}{eos}\n<|assistant|>\n"` shape TinyLlama-Chat/Zephyr-style models
-      use — not a Jinja2 `chat_template` interpreter)
+      use)
+- [x] **Real Jinja2-like chat template engine** — `formatChatPrompt()`/`defaultChatTemplate()`
+      (`include/campello_llm/chat_template.hpp` + `src/chat_template/`) supersede
+      `formatSingleTurnChatPrompt()`'s single hardcoded literal shape: for-loops
+      (`loop.first`/`loop.last`/`loop.index`), `if`/`elif`/`else`, string/member-access expressions,
+      `==`/`!=`/`and`/`or`/`not`/`+`. Renders each model's own `tokenizer_config.json` chat_template
+      string for real multi-turn conversations instead of assuming one fixed shape.
 - [x] Tests: encode/decode round-trip (49 tests total, including negative tests for unsupported
       tokenizer.json shapes), and encode output checked against a known-good reference tokenization
       for real strings (CJK, emoji/byte-fallback, accented Latin, multi-space, literal added-token
@@ -147,9 +152,12 @@ doesn't model on its own.
 - [x] `Model::load(context, directory)` — reads `config.json`/`tokenizer.json`/`tokenizer_config.json`/
       `model.safetensors` from a directory (the standard HF layout) and builds one fixed-`seqLen=1`
       KV-cache decode graph (`buildLlamaDecodeGraph()`), sized to `maxSequenceLength`'s cache
-      capacity. **Scope cut still standing** (see `CLAUDE.md`): only the safetensors+LLaMA path is
-      wired (no gguf-format dispatch, no `loadFromMemory` Android-asset variant yet) — revisit
-      if/when the gguf target model or Android packaging is actually worked on.
+      capacity.
+- [x] `Model::load(context, ggufPath)` — detects a `.gguf` file path, reads the embedded LLaMA
+      config/tokenizer/weights via `loadLlamaConfigFromGgufFile()`/`loadTokenizerFromGgufFile()`/
+      `GgufWeightsAdapter()`, and builds the same decode graph. Graph cache is stored as a sibling
+      `.campello_llm_decode_graph.<maxSequenceLength>.cache` file. **Scope cut still standing:** no
+      `loadFromMemory` Android-asset variant yet — revisit when Android packaging is actually worked on.
 - [x] **Graph caching implemented.** `Model::load()` checks for a sibling
       `campello_llm_decode_graph.<maxSequenceLength>.cache` file first (`graphCachePath()`/
       `isGraphCacheFresh()` in `src/model.cpp`, an mtime check against `model.safetensors`/
@@ -300,12 +308,16 @@ one at a time, but that raw whole-file buffer sits resident throughout regardles
       would double resident weight memory, ~4GB → ~8GB for TinyLlama). Cost: prefill is
       `promptLength` sequential small dispatches instead of one batched dispatch — judged worth it
       given the project's actual memory constraints (see `CLAUDE.md`).
-- [x] **KV-cache growth strategy** — **decided in Phase 4: pre-allocate, sized to
-      `maxSequenceLength`** (the `Model::load()`-time cache capacity), not `GenerationConfig::maxTokens`
-      (a per-`generate()`-call value not known at graph-build time, since the graph is built once at
-      `load()`). This was the only option actually available, not a tradeoff decision — the decode
-      graph's per-layer cache-tensor shape is baked in at build time, and `maxSequenceLength` is the
-      only relevant value that exists then.
+- [x] **KV-cache growth strategy** — **originally decided in Phase 4: pre-allocate, sized to
+      `maxSequenceLength`** (the `Model::load()`-time cache capacity), not `GenerationConfig::maxTokens`.
+      **Superseded:** `Model::load()` now starts at a small fixed capacity (256 tokens) and
+      `generate()` doubles it — rebuilding (or loading from its own on-disk cache) the compiled
+      decode graph at each new capacity tier — only as an actual conversation needs more room, up to
+      `maxSequenceLength`. `generate()` is no longer `const` as a result (`currentCapacity_`/
+      `rebuildGraph_` on `Model`). Short conversations no longer pay the memory/load-time cost of a
+      `maxSequenceLength`-sized KV-cache/graph they'll never fill — found to matter in practice while
+      chasing real memory usage on `llama3.1_8b` inference (see `campello_nn`'s changelog for the
+      `GpuGeneric`-backend side of that investigation).
 - [ ] **DirectML `RmsNorm` gap** — `campello_nn`'s DirectML backend doesn't implement `RmsNorm` yet
       (throws clearly rather than guessing; see that project's `TODO.md` Phase 5 "Op-set prep"
       note on `DML_MEAN_VARIANCE_NORMALIZATION1_OPERATOR_DESC`). LLaMA-style wiring (Phase 3) won't

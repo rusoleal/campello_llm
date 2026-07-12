@@ -118,14 +118,18 @@ namespace systems::leal::campello_llm
         cnn::Operand lnFBias = constantWeight(builder, weights, "ln_f.bias", {hidden3});
         hidden = builder.layerNorm(hidden, lnFWeight, lnFBias, config.layerNormEps);
 
-        cnn::Operand lmHeadWeight =
-            constantLinearWeightTransposed(builder, weights, "wte.weight", config.vocabSize, config.hiddenSize);
-        cnn::Operand logits = builder.matmul(hidden, lmHeadWeight); // [seqLen, vocabSize]
+        LinearWeight lmHeadWeight =
+            loadLinearWeight(builder, weights, "wte.weight", config.vocabSize, config.hiddenSize);
+        cnn::Operand logits = applyLinear(builder, hidden, lmHeadWeight, config.vocabSize, config.hiddenSize); // [seqLen, vocabSize]
 
         std::unordered_map<std::string, cnn::Operand> outputOperands = {{"logits", logits}};
         ArchitectureGraphResult result;
-        result.graph = builder.build(outputOperands);
+        // serialize() before build() -- GraphBuilder::build() moves (rather than
+        // copies) the builder's IR into the compiled graph, so it must run last,
+        // after anything else that still needs the builder's IR intact (see
+        // campello_nn's Backend::compileGraph() doc comment).
         result.serializedGraph = builder.serialize(outputOperands);
+        result.graph = builder.build(outputOperands);
         result.inputs["input_ids"] = {cnn::DataType::Int32, {seqLen}, false, true};
         result.outputs["logits"] = {cnn::DataType::Float32, {seqLen, config.vocabSize}, true, false};
         return result;

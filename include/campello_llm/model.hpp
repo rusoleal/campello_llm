@@ -40,10 +40,11 @@ namespace systems::leal::campello_llm
     {
     public:
         /**
-         * @brief Loads a model from a directory containing `config.json`,
-         * `tokenizer.json`, `tokenizer_config.json`, and `model.safetensors` — the
-         * standard HuggingFace LLaMA checkpoint layout (e.g. as downloaded from
-         * `TinyLlama/TinyLlama-1.1B-Chat-v1.0`).
+         * @brief Loads a model from either:
+         *   - a directory containing `config.json`, `tokenizer.json`,
+         *     `tokenizer_config.json`, and `model.safetensors` — the standard
+         *     HuggingFace LLaMA checkpoint layout (e.g. `TinyLlama/TinyLlama-1.1B-Chat-v1.0`), or
+         *   - a `.gguf` file containing embedded LLaMA config, tokenizer, and weights.
          *
          * @param maxSequenceLength Fixed size of the compiled graph — the hard cap on
          * prompt-tokens-plus-generated-tokens for any `generate()` call against the
@@ -72,14 +73,33 @@ namespace systems::leal::campello_llm
          * have been generated).
          * @throws std::runtime_error if the tokenized prompt (plus its BOS) already
          * reaches `maxSequenceLength`, leaving no room to generate anything.
+         *
+         * Not `const`: the KV-cache capacity backing this call starts small and grows
+         * (doubling, capped at `maxSequenceLength`) as the conversation needs more
+         * room, rebuilding the compiled decode graph on each doubling — see
+         * `currentCapacity_`/`rebuildGraph_`. That capacity is a `Model`-lifetime
+         * high-water mark, so later calls reuse whatever a previous call already grew
+         * into instead of starting over.
          */
         std::string generate(const std::string &prompt, const GenerationConfig &config,
-                              const std::function<void(const std::string &)> &onToken = nullptr) const;
+                              const std::function<void(const std::string &)> &onToken = nullptr);
 
         const Tokenizer &tokenizer() const { return *tokenizer_; }
 
+        std::int64_t maxSequenceLength() const { return maxSequenceLength_; }
+        std::int64_t vocabSize() const { return vocabSize_; }
+        std::int64_t numLayers() const { return numLayers_; }
+        const std::string &architectureName() const { return architectureName_; }
+
     private:
         Model() = default;
+
+        static std::unique_ptr<Model> loadFromSafetensorsDirectory(
+            std::shared_ptr<systems::leal::campello_nn::Context> context, const std::string &directory,
+            std::int64_t maxSequenceLength);
+        static std::unique_ptr<Model> loadFromGgufFile(
+            std::shared_ptr<systems::leal::campello_nn::Context> context, const std::string &path,
+            std::int64_t maxSequenceLength);
 
         std::shared_ptr<systems::leal::campello_nn::Context> context_;
         std::unique_ptr<Tokenizer> tokenizer_;
@@ -91,6 +111,22 @@ namespace systems::leal::campello_llm
         std::int64_t numKeyValueHeads_ = 0;
         std::int64_t headDim_ = 0;
         float ropeTheta_ = 10000.0f;
+        std::string architectureName_ = "llama";
+
+        // KV-cache/decode-graph capacity currently backing `graph_` (<= maxSequenceLength_).
+        // Starts at a small initial bucket and only ever grows (doubling), so a Model
+        // that never sees a long conversation never pays for a maxSequenceLength_-sized
+        // KV-cache. See `generate()`'s KV-cache-growth lambda.
+        std::int64_t currentCapacity_ = 0;
+
+        // Rebuilds (or loads from the on-disk decode-graph cache) the compiled decode
+        // graph at a new capacity, re-reading weights from their original file rather
+        // than retaining a parsed copy on `Model` for this purpose alone -- the graph
+        // already holds its own copy of every weight it binds as a constant, so keeping
+        // a second parsed copy around just to make regrowth cheap would double the
+        // resident weight memory. Set once at load time (captures the model's path and
+        // `LlamaConfig`, not the parsed weights file).
+        std::function<ArchitectureGraphResult(std::int64_t)> rebuildGraph_;
     };
 
 } // namespace systems::leal::campello_llm

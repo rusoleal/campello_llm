@@ -187,8 +187,14 @@ the literal-added-token-recognition edge case above.
   for not-yet-filled slots). Per layer, the freshly rotated K / projected V for just the current
   token (`llamaKeyCacheOutputName(i)`/`llamaValueCacheOutputName(i)`, shape
   `[numKeyValueHeads, 1, headDim]`) is `concat()`-ed onto that layer's incoming
-  `[numKeyValueHeads, maxSequenceLength, headDim]` cache input before `repeatKvHeads()`/attention,
-  giving every call a `[maxSequenceLength + 1]`-length keys/values axis (cache + current token);
+  `[numKeyValueHeads, maxSequenceLength, headDim]` cache input, then into the attention matmuls —
+  via `campello_nn::GraphBuilder::gqaMatMul()` on `Cpu`/`GpuGeneric` (checked via
+  `context->deviceType()`), or the older `repeatKvHeads()` slice()+concat() composition on
+  MPSGraph/DirectML (see the GQA repeat-kv gotcha below, and `gqaMatMul()`'s own doc comment in
+  `campello_nn` for why the split exists: physically replicating K/V scales with
+  `numAttentionHeads × contextLength` **summed across every layer**, which dominated `GpuGeneric`'s
+  memory usage on real long-context inference) — giving every call a `[maxSequenceLength + 1]`-length
+  keys/values axis (cache + current token);
   those same pre-concat K/V become the graph's per-layer outputs, for the caller to fold into its
   own persistent cache buffer at the right slot before the next call. Verified against
   `buildLlamaGraph()`'s own numpy-checked output: `LlamaArchitecture.
@@ -209,7 +215,11 @@ the literal-added-token-recognition edge case above.
     `numAttentionHeads=32`. `matmul()` requires exactly-matching batch dimensions (no broadcasting),
     so K/V must be physically repeated up to the full head count before the batched attention
     matmul — `repeatKvHeads()` does this via `slice()`+`concat()`, replicating each KV head
-    contiguously (`[kv0,kv0,...,kv1,kv1,...]`), matching PyTorch's standard `repeat_kv` layout.
+    contiguously (`[kv0,kv0,...,kv1,kv1,...]`), matching PyTorch's standard `repeat_kv` layout. Used
+    unconditionally here (`buildLlamaGraph()` isn't on `Model`'s serving path — see "First Target
+    Model" below) and as `buildLlamaDecodeGraph()`'s fallback for backends without `gqaMatMul()`
+    (MPSGraph/DirectML); `Cpu`/`GpuGeneric` use `gqaMatMul()` instead (see above) specifically to
+    avoid this physical replication's memory cost on real long-context models.
   - Only Float32 weights are supported (`constantWeight()`/`constantLinearWeightTransposed()` throw
     otherwise) — **real TinyLlama checkpoints are BF16** (`torch_dtype: bfloat16` in its
     `config.json`), so loading one for real needs a BF16->F32 (or ->F16) conversion step that
@@ -265,38 +275,57 @@ load and talk to.
   `num_attention_heads` (plain MHA) and `rope_theta` defaults to `10000.0` when absent, matching
   `transformers`' own defaults for configs that predate those fields. Tested against TinyLlama's
   real `config.json`, not just a synthetic one.
-- **`Model::load(context, directory, maxSequenceLength)`** reads the standard HF directory layout
+- **`Model::load(context, path, maxSequenceLength)`** dispatches on `path` to one of two private
+  static factories: **`loadFromSafetensorsDirectory()`** reads the standard HF directory layout
   (`config.json`, `tokenizer.json`, `tokenizer_config.json`, `model.safetensors` — confirmed against
-  the real `TinyLlama/TinyLlama-1.1B-Chat-v1.0` repo's file listing) and calls
-  `buildLlamaDecodeGraph()` **once**, at a fixed `maxSequenceLength` (the KV-cache's capacity, i.e.
-  the hard cap on prompt-tokens-plus-generated-tokens — same meaning as before, just enforced via
-  cache size instead of a padded sequence length now). The multi-gigabyte `WeightsFile` is scoped to
-  die right after that call (`constant()` copies bytes immediately — see Phase 3 notes — so nothing
-  needs it afterward). **Only the safetensors+LLaMA path is wired** — no gguf dispatch through the
-  architecture registry, no `loadFromMemory`/Android-asset variant. `tie_word_embeddings`,
-  `pretraining_tp`, and other LLaMA `config.json` fields beyond what `LlamaConfig` already has
-  aren't read.
-- **Graph caching is implemented** — `Model::load()` writes/reads a sibling
-  `campello_llm_decode_graph.<maxSequenceLength>.cache` file in the model directory via
-  `campello_nn::saveGraphToFile`/`loadGraphFromFile`, keyed by `maxSequenceLength` since that's
-  baked into the decode graph's per-layer cache-tensor shapes (a different `maxSequenceLength` is a
-  structurally different graph, not just a different runtime parameter — see `graphCachePath()` in
-  `src/model.cpp`). Freshness is a cheap mtime check (`isGraphCacheFresh()`): the cache is only
-  trusted if it's at least as new as both `model.safetensors` and `config.json`, the same heuristic
-  build-artifact caches like `make`/`ccache` use rather than a content hash. A missing/stale cache,
-  or one that fails `loadGraphFromFile()`'s own magic/version check (corrupt or from an incompatible
-  `campello_nn` version), falls back to building fresh via `buildLlamaDecodeGraph()` rather than
-  failing `Model::load()`; writing a fresh cache back is similarly best-effort (a read-only model
-  directory shouldn't fail loading, it just skips caching for next time). Round-tripped and the
-  corrupt-cache fallback both covered by `Model.GraphCacheRoundTripProducesIdenticalOutput`/
-  `Model.CorruptGraphCacheFallsBackToBuildingFresh` in `tests/test_model.cpp`.
+  the real `TinyLlama/TinyLlama-1.1B-Chat-v1.0` repo's file listing), or **`loadFromGgufFile()`**
+  reads a single `.gguf` file's embedded config/tokenizer/weights (`loadLlamaConfigFromGgufFile()`/
+  `loadTokenizerFromGgufFile()`/`GgufWeightsAdapter`) — the gguf-dispatch gap this section used to
+  call out as not-yet-wired is closed; both paths build the same `buildLlamaDecodeGraph()`.
+  `maxSequenceLength` is still the hard cap on prompt-tokens-plus-generated-tokens, but the compiled
+  graph/KV-cache no longer starts there — see `generate()`'s growth behavior below. The
+  multi-gigabyte `WeightsFile`/`GgufFile` is scoped to die right after each build call (`constant()`
+  copies bytes immediately — see Phase 3 notes — so nothing needs it afterward); regrowth (below)
+  re-reads from disk rather than retaining a parsed copy for that purpose, for the same reason.
+  `tie_word_embeddings`, `pretraining_tp`, and other LLaMA `config.json`/GGUF-metadata fields beyond
+  what `LlamaConfig` already has aren't read. No `loadFromMemory`/Android-asset variant yet.
+- **Graph caching is implemented** — writes/reads a sibling
+  `<model>.campello_llm_decode_graph.<capacity>.cache` file (gguf) or
+  `campello_llm_decode_graph.<capacity>.cache` file in the model directory (safetensors) via
+  `campello_nn::saveGraphToFile`/`loadGraphFromFile`, keyed by **capacity** (the KV-cache tier
+  currently in effect — see below — not necessarily `maxSequenceLength` itself) since that's baked
+  into the decode graph's per-layer cache-tensor shapes (a different capacity is a structurally
+  different graph, not just a different runtime parameter — see `graphCachePath()`/
+  `ggufGraphCachePath()` in `src/model.cpp`). Freshness is a cheap mtime check
+  (`isGraphCacheFresh()`): the cache is only trusted if it's at least as new as the weights file
+  (and `config.json`, for safetensors), the same heuristic build-artifact caches like `make`/
+  `ccache` use rather than a content hash. A missing/stale cache, or one that fails
+  `loadGraphFromFile()`'s own magic/version check (corrupt or from an incompatible `campello_nn`
+  version), falls back to building fresh via `buildLlamaDecodeGraph()` rather than failing; writing
+  a fresh cache back is similarly best-effort (a read-only model directory shouldn't fail loading,
+  it just skips caching for next time). Round-tripped and the corrupt-cache fallback both covered by
+  `Model.GraphCacheRoundTripProducesIdenticalOutput`/`Model.CorruptGraphCacheFallsBackToBuildingFresh`
+  in `tests/test_model.cpp`.
+- **KV-cache capacity starts small and grows on demand**, rather than always being pre-allocated at
+  `maxSequenceLength` (a real memory-usage fix, not just a load-time one — found to matter while
+  chasing `GpuGeneric`'s memory usage on real `llama3.1_8b` inference, see the `campello_nn`
+  changelog for the backend-side counterpart). `Model::load()` builds the initial decode graph/
+  KV-cache at `min(256, maxSequenceLength)` (`currentCapacity_`, `initialCapacityFor()` in
+  `src/model.cpp`) rather than `maxSequenceLength` itself. `generate()` (no longer `const` — this is
+  why) doubles `currentCapacity_` and rebuilds the compiled graph (`rebuildGraph_`, a closure over
+  the model's path/config captured at load time, re-reading weights from disk rather than retaining
+  a parsed copy — see above) whenever the prompt-plus-generation would exceed the current capacity,
+  up to `maxSequenceLength`. `currentCapacity_` is a `Model`-lifetime high-water mark: once grown, it
+  never shrinks back down, so a later short `generate()` call reuses whatever a previous longer one
+  already grew into. Covered by `Model.KvCacheGrowsAcrossCapacityBoundaryWithoutCorruption` in
+  `tests/test_model.cpp`.
 - **`Model::generate()`** (`src/model.cpp`) — real KV-cache, host-managed. Allocates one
-  zero-initialized `[numKeyValueHeads, maxSequenceLength, headDim]` buffer per layer per K/V (zeroed
+  zero-initialized `[numKeyValueHeads, currentCapacity_, headDim]` buffer per layer per K/V (zeroed
   so not-yet-filled slots are deterministic, harmless once `attn_mask` masks them out regardless —
-  not garbage memory). Two phases through the same `dispatchStep(tokenId, position)` helper (one
-  `buildLlamaDecodeGraph()` dispatch each call, writing that position's `rope_cos`/`rope_sin`/
-  `attn_mask`/cache-in tensors and folding the K/V outputs into the host cache buffers at slot
-  `position` before returning):
+  not garbage memory) at whatever capacity tier is in effect (see above). Two phases through the
+  same `dispatchStep(tokenId, position)` helper (one `buildLlamaDecodeGraph()` dispatch each call,
+  writing that position's `rope_cos`/`rope_sin`/`attn_mask`/cache-in tensors and folding the K/V
+  outputs into the host cache buffers at slot `position` before returning):
   - **Phase A (prefill):** one `dispatchStep()` call per prompt token (positions `0` ..
     `promptLength-1`), filling the cache; the last call's logits seed phase B's first sample.
   - **Phase B (decode):** sample from the previous call's logits, append/stream/check stop
@@ -318,8 +347,14 @@ load and talk to.
   step and emits only the new suffix, rather than decoding/emitting per-token — necessary because a
   byte-fallback multi-byte UTF-8 character can span several token ids that only decode to real text
   once all of them exist.
-- **`formatSingleTurnChatPrompt()`** (Phase 2, `tokenizer.hpp`) plus a small CLI
-  (`examples/cli_chat/`, `option(BUILD_EXAMPLES ...)`, mirrors `campello_nn`'s own example
+- **Chat templating**: `formatSingleTurnChatPrompt()` (Phase 2, `tokenizer.hpp`) is still the
+  literal-single-shape formatter; `formatChatPrompt()`/`defaultChatTemplate()`
+  (`include/campello_llm/chat_template.hpp` + `src/chat_template/`) are the real addition — a small
+  Jinja2-like interpreter (for-loops with `loop.first`/`loop.last`/`loop.index`, `if`/`elif`/`else`,
+  string/member-access expressions, `==`/`!=`/`and`/`or`/`not`/`+`) that renders a model's *actual*
+  `tokenizer_config.json` `chat_template` string for real multi-turn conversations, rather than
+  assuming every model uses the one literal shape `formatSingleTurnChatPrompt()` hardcodes. Plus a
+  small CLI (`examples/cli_chat/`, `option(BUILD_EXAMPLES ...)`, mirrors `campello_nn`'s own example
   CMake/option pattern **including its `BUILD_TESTS`-style name collision** — `BUILD_EXAMPLES` is
   forced off around `FetchContent_MakeAvailable(campello_nn)` too, for the same reason as
   `BUILD_TESTS`) is the actual minimum interactive example: load a model directory, read a line,
@@ -344,13 +379,18 @@ real KV-cache; `Model::load()`/`generate()` can load and run TinyLlama's actual 
 `TODO.md`'s Phase 6 note on the real end-to-end attempt — and its CPU-performance caveat: even with
 the KV-cache eliminating the old `O(maxSequenceLength²)` blowup, a *single* token's forward pass
 through all 22 layers is itself slow on campello_nn's current reference CPU backend, no
-BLAS/SIMD-optimized GEMM — for how well "run" holds up in practice). A small GGUF-quantized build of
-the same architecture is the second target, once gguf
-dispatch is wired into `Model::load()` — gguf's embedded vocab/merges should reuse the tokenizer's
-existing BPE encode/decode logic rather than a second implementation. GPT-style architecture
-(`buildGptGraph()`) is implemented and tested but isn't a target model on its own — it exists
-specifically to validate the architecture registry generalizes instead of being accidentally
-LLaMA-shaped (see `TODO.md` Phase 3).
+BLAS/SIMD-optimized GEMM — for how well "run" holds up in practice).
+
+**Second target: real GGUF-quantized models, gguf dispatch now wired.** `loadFromGgufFile()`
+(above) is done — `Model::load()` accepts a `.gguf` path directly, `Q4_0` through the full K-quant
+set (`Q2_K`-`Q8_K`) dequantize, and `loadTokenizerFromGgufFile()` handles both SentencePiece-style
+(`tokenizer.ggml.model = "llama"`) and byte-level-BPE (`"gpt2"`, needed for Llama 3.1+) vocabs. Real
+`llama3.1_8b` (Q4_K_M) inference against this path is what surfaced the KV-cache-growth and
+`gqaMatMul` memory work above — see the changelog for both projects' before/after numbers; the
+`GpuGeneric` backend's own generated-output correctness (separate from memory) is still an open,
+unresolved bug as of this writing. GPT-style architecture (`buildGptGraph()`) is implemented and
+tested but isn't a target model on its own — it exists specifically to validate the architecture
+registry generalizes instead of being accidentally LLaMA-shaped (see `TODO.md` Phase 3).
 
 ### Conventions Inherited from campello_nn
 
@@ -377,7 +417,15 @@ LLaMA-shaped (see `TODO.md` Phase 3).
 
 Phases 0-3 (scaffolding, weights-file parsing, tokenizer, architecture registry/graph wiring) are
 done. Phases 4-5 (`Model::load()`/`generate()`) are done, including a real KV-cache
-(`buildLlamaDecodeGraph()` — see above) and graph caching (see above) — the one deliberate
-remaining scope cut is no gguf dispatch. BF16/F16 weight conversion is done, so TinyLlama's real
-checkpoint loads. See `TODO.md` for what's still open, then Phase 6 (cross-backend conformance,
-benchmarks, graph-caching demo).
+(`buildLlamaDecodeGraph()` — see above), graph caching (see above), and gguf dispatch
+(`loadFromGgufFile()` — the scope cut this section used to note is closed). BF16/F16 weight
+conversion is done, so TinyLlama's real checkpoint loads; full GGML/K-quant dequantization is done,
+so real GGUF exports (Llama 3.1's `Q4_K_M` included) load too. KV-cache/decode-graph capacity now
+grows on demand instead of always pre-allocating at `maxSequenceLength`, and the GQA attention block
+uses `campello_nn`'s `gqaMatMul()` on `Cpu`/`GpuGeneric` instead of physically replicating K/V — both
+found necessary while chasing real memory usage on `llama3.1_8b` inference (see both projects'
+changelogs). Real chat templating (`formatChatPrompt()`) replaces the single-shape
+`formatSingleTurnChatPrompt()` for actual multi-turn use. **Still open:** the `GpuGeneric` backend's
+generated output is not yet verified correct on real models (a separate, unresolved bug from the
+memory work above); see `TODO.md` for everything else still open, then Phase 6 (cross-backend
+conformance, benchmarks, graph-caching demo).

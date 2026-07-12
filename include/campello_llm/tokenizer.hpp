@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -11,10 +12,28 @@
 namespace systems::leal::campello_llm
 {
 
+    class GgufFile; // Forward declaration for the GGUF-backed tokenizer factory.
+
     /**
-     * @brief A HuggingFace "fast" tokenizer (`tokenizer.json`), scoped to the
-     * SentencePiece-style byte-fallback BPE shape LLaMA/TinyLlama-family models ship
-     * (the model chosen in `TODO.md`'s Open Questions). Specifically requires:
+     * @brief Internal discriminator for the tokenizer flavour loaded.
+     */
+    enum class TokenizerModel
+    {
+        LlamaSentencePiece, ///< SentencePiece-style BPE (LLaMA/TinyLlama), uses ▁ normalizer/decoder.
+        Gpt2ByteLevel,      ///< GPT-2 byte-level BPE (Llama 3), uses bytes-to-unicode mapping.
+    };
+
+    /**
+     * @brief Fills @p out with the standard GPT-2 bytes-to-unicode mapping.
+     * @internal Used by the GGUF tokenizer loader.
+     */
+    void buildGpt2ByteToUnicode(std::array<char32_t, 256> &out);
+
+    /**
+     * @brief A HuggingFace "fast" tokenizer (`tokenizer.json`) or a GGUF embedded
+     * tokenizer (`tokenizer.ggml.*` metadata), scoped to the SentencePiece-style
+     * byte-fallback BPE shape LLaMA/TinyLlama-family models ship (the model chosen in
+     * `TODO.md`'s Open Questions). Specifically requires:
      *   - `model.type == "BPE"` with `byte_fallback` support
      *   - `normalizer`: `null`, or a `Sequence` of exactly `[Prepend, Replace(" "->"▁")]`
      *   - `pre_tokenizer`: `null` (the whole normalized text is one BPE "word")
@@ -71,6 +90,7 @@ namespace systems::leal::campello_llm
 
     private:
         friend std::unique_ptr<Tokenizer> loadTokenizerFromMemory(const void *data, std::size_t size);
+        friend std::unique_ptr<Tokenizer> loadTokenizerFromGgufFile(const GgufFile &file);
 
         struct AddedToken
         {
@@ -89,6 +109,11 @@ namespace systems::leal::campello_llm
         bool hasDecoder_ = false;    // Sequence[Replace("▁"->" "), ByteFallback, Fuse, Strip(" ",1,0)]
         std::int32_t unkId_ = -1;
         std::int32_t bosId_ = -1;
+        TokenizerModel model_ = TokenizerModel::LlamaSentencePiece;
+        // GPT-2 byte-level BPE state. byteToUnicode_[b] is the Unicode char used to
+        // represent byte b in the BPE vocab; unicodeToByte_ is the inverse map.
+        std::array<char32_t, 256> byteToUnicode_{};
+        std::unordered_map<char32_t, std::uint8_t> unicodeToByte_;
 
         std::vector<std::int32_t> bpeTokenizeWord(const std::string &word) const;
     };
@@ -104,6 +129,17 @@ namespace systems::leal::campello_llm
      * @brief Reads `path` into memory and calls `loadTokenizerFromMemory()`.
      */
     std::unique_ptr<Tokenizer> loadTokenizerFromFile(const std::string &path);
+
+    /**
+     * @brief Builds a Tokenizer from GGUF embedded tokenizer metadata
+     * (`tokenizer.ggml.tokens`, `tokenizer.ggml.merges`, token ids, etc.).
+     *
+     * Only the SentencePiece-style BPE shape used by LLaMA-family GGUF models is
+     * supported (same symbol table, byte-fallback, and normalizer/decoder semantics as
+     * `loadTokenizerFromMemory()`). Throws for unsupported tokenizer.ggml.model values
+     * or missing required fields.
+     */
+    std::unique_ptr<Tokenizer> loadTokenizerFromGgufFile(const GgufFile &file);
 
     /**
      * @brief Renders the literal `"<|{role}|>\n{content}{eosToken}\n<|assistant|>\n"`

@@ -6,6 +6,8 @@
 
 #include <campello_nn/float16.hpp>
 
+#include "../gguf/gguf_dequantize.hpp"
+
 namespace systems::leal::campello_llm::internal
 {
     namespace
@@ -42,19 +44,34 @@ namespace systems::leal::campello_llm::internal
         // Real LLaMA/GPT checkpoints commonly ship BF16 (confirmed against
         // TinyLlama's real config.json: `"torch_dtype": "bfloat16"`) or F16 weights,
         // not Float32 -- decode whichever was actually stored into a Float32 buffer
-        // host-side, once, at graph-build time. Anything else (Int8 quantized
-        // weights, etc.) throws rather than guess a dequantization scheme.
+        // host-side, once, at graph-build time. Unsupported integer-only or
+        // future quantization types throw rather than guess a dequantization scheme.
+        std::int64_t tensorElementCount(const TensorInfo &t)
+        {
+            std::int64_t count = 1;
+            for (std::int64_t dim : t.shape)
+            {
+                count *= dim;
+            }
+            return count;
+        }
+
         std::vector<float> decodeWeightToFloat32(const std::string &name, const TensorInfo &t)
         {
-            std::size_t count = t.byteLength / weightDTypeSize(t.dtype);
-            std::vector<float> out(count);
+            std::vector<float> out;
             switch (t.dtype)
             {
             case WeightDType::F32:
+            {
+                std::size_t count = t.byteLength / sizeof(float);
+                out.resize(count);
                 std::memcpy(out.data(), t.data, t.byteLength);
                 break;
+            }
             case WeightDType::F16:
             {
+                std::size_t count = t.byteLength / sizeof(std::uint16_t);
+                out.resize(count);
                 const auto *src = reinterpret_cast<const std::uint16_t *>(t.data);
                 for (std::size_t i = 0; i < count; ++i)
                 {
@@ -64,6 +81,8 @@ namespace systems::leal::campello_llm::internal
             }
             case WeightDType::BF16:
             {
+                std::size_t count = t.byteLength / sizeof(std::uint16_t);
+                out.resize(count);
                 const auto *src = reinterpret_cast<const std::uint16_t *>(t.data);
                 for (std::size_t i = 0; i < count; ++i)
                 {
@@ -71,9 +90,27 @@ namespace systems::leal::campello_llm::internal
                 }
                 break;
             }
+            case WeightDType::Q4_0:
+            case WeightDType::Q4_1:
+            case WeightDType::Q5_0:
+            case WeightDType::Q5_1:
+            case WeightDType::Q8_0:
+            case WeightDType::Q8_1:
+            case WeightDType::Q2_K:
+            case WeightDType::Q3_K:
+            case WeightDType::Q4_K:
+            case WeightDType::Q5_K:
+            case WeightDType::Q6_K:
+            case WeightDType::Q8_K:
+                out = dequantizeGgufTensorToFloat32(t);
+                if (static_cast<std::int64_t>(out.size()) != tensorElementCount(t))
+                {
+                    throw std::runtime_error("campello_llm: dequantized weight '" + name + "' element count mismatch");
+                }
+                break;
             default:
                 throw std::runtime_error("campello_llm: weight '" + name +
-                                          "' has an unsupported dtype (only F32/F16/BF16 are supported)");
+                                          "' has an unsupported dtype (only F32/F16/BF16 and GGML block-quantized types are supported)");
             }
             return out;
         }
@@ -107,6 +144,101 @@ namespace systems::leal::campello_llm::internal
         }
         return builder.constant({cnn::DataType::Float32, {inDim, outDim}, false, false}, transposed.data(),
                                  transposed.size() * sizeof(float));
+    }
+
+    std::int32_t weightDTypeToGgmlType(WeightDType dtype)
+    {
+        switch (dtype)
+        {
+        case WeightDType::Q4_0:
+            return 2;
+        case WeightDType::Q4_1:
+            return 3;
+        case WeightDType::Q5_0:
+            return 6;
+        case WeightDType::Q5_1:
+            return 7;
+        case WeightDType::Q8_0:
+            return 8;
+        case WeightDType::Q8_1:
+            return 9;
+        case WeightDType::Q2_K:
+            return 10;
+        case WeightDType::Q3_K:
+            return 11;
+        case WeightDType::Q4_K:
+            return 12;
+        case WeightDType::Q5_K:
+            return 13;
+        case WeightDType::Q6_K:
+            return 14;
+        case WeightDType::Q8_K:
+            return 15;
+        default:
+            return -1;
+        }
+    }
+
+    bool isGgmlQuantizedType(WeightDType dtype)
+    {
+        switch (dtype)
+        {
+        case WeightDType::Q4_0:
+        case WeightDType::Q4_1:
+        case WeightDType::Q5_0:
+        case WeightDType::Q5_1:
+        case WeightDType::Q8_0:
+        case WeightDType::Q8_1:
+        case WeightDType::Q2_K:
+        case WeightDType::Q3_K:
+        case WeightDType::Q4_K:
+        case WeightDType::Q5_K:
+        case WeightDType::Q6_K:
+        case WeightDType::Q8_K:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    LinearWeight loadLinearWeight(cnn::GraphBuilder &builder, const WeightsFile &weights,
+                                   const std::string &name, std::int64_t outDim, std::int64_t inDim)
+    {
+        const TensorInfo &t = findWeight(weights, name);
+        checkShape(name, t.shape, {outDim, inDim});
+
+        if (isGgmlQuantizedType(t.dtype))
+        {
+            std::int32_t ggmlType = weightDTypeToGgmlType(t.dtype);
+            if (ggmlType < 0)
+                throw std::runtime_error("campello_llm: internal error mapping dtype for weight '" + name + "'");
+            cnn::Operand raw = builder.constant(
+                {cnn::DataType::Int8, {static_cast<std::int64_t>(t.byteLength)}, false, false},
+                t.data, t.byteLength);
+            return LinearWeight{raw, true, ggmlType};
+        }
+
+        std::vector<float> decoded = decodeWeightToFloat32(name, t);
+        std::vector<float> transposed(static_cast<std::size_t>(outDim * inDim));
+        for (std::int64_t row = 0; row < outDim; ++row)
+        {
+            for (std::int64_t col = 0; col < inDim; ++col)
+            {
+                transposed[static_cast<std::size_t>(col * outDim + row)] =
+                    decoded[static_cast<std::size_t>(row * inDim + col)];
+            }
+        }
+        cnn::Operand operand = builder.constant({cnn::DataType::Float32, {inDim, outDim}, false, false},
+                                                 transposed.data(), transposed.size() * sizeof(float));
+        return LinearWeight{operand, false, 0};
+    }
+
+    cnn::Operand applyLinear(cnn::GraphBuilder &builder, cnn::Operand input, const LinearWeight &weight,
+                              std::int64_t outDim, std::int64_t inDim)
+    {
+        if (weight.isQuantized)
+            return builder.ggmlQuantizedMatmul(input, weight.operand, weight.ggmlQuantType, {inDim, outDim});
+        return builder.matmul(input, weight.operand);
     }
 
     cnn::Operand constantScalarF32(cnn::GraphBuilder &builder, float value)

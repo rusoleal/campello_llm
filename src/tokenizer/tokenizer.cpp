@@ -143,10 +143,95 @@ namespace
         return out;
     }
 
+    std::string char32ToUtf8(char32_t c)
+    {
+        std::string s;
+        if (c <= 0x7F)
+        {
+            s.push_back(static_cast<char>(c));
+        }
+        else if (c <= 0x7FF)
+        {
+            s.push_back(static_cast<char>(0xC0 | (c >> 6)));
+            s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        }
+        else if (c <= 0xFFFF)
+        {
+            s.push_back(static_cast<char>(0xE0 | (c >> 12)));
+            s.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+            s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        }
+        else
+        {
+            s.push_back(static_cast<char>(0xF0 | (c >> 18)));
+            s.push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
+            s.push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+            s.push_back(static_cast<char>(0x80 | (c & 0x3F)));
+        }
+        return s;
+    }
+
+    char32_t utf8CharToCodePoint(const std::string &s)
+    {
+        if (s.empty())
+        {
+            return 0;
+        }
+        unsigned char b0 = static_cast<unsigned char>(s[0]);
+        if ((b0 & 0x80) == 0x00)
+        {
+            return static_cast<char32_t>(b0);
+        }
+        if ((b0 & 0xE0) == 0xC0 && s.size() >= 2)
+        {
+            return static_cast<char32_t>(((b0 & 0x1F) << 6) | (static_cast<unsigned char>(s[1]) & 0x3F));
+        }
+        if ((b0 & 0xF0) == 0xE0 && s.size() >= 3)
+        {
+            return static_cast<char32_t>(((b0 & 0x0F) << 12) |
+                                           ((static_cast<unsigned char>(s[1]) & 0x3F) << 6) |
+                                           (static_cast<unsigned char>(s[2]) & 0x3F));
+        }
+        if ((b0 & 0xF8) == 0xF0 && s.size() >= 4)
+        {
+            return static_cast<char32_t>(((b0 & 0x07) << 18) |
+                                           ((static_cast<unsigned char>(s[1]) & 0x3F) << 12) |
+                                           ((static_cast<unsigned char>(s[2]) & 0x3F) << 6) |
+                                           (static_cast<unsigned char>(s[3]) & 0x3F));
+        }
+        return static_cast<char32_t>(b0);
+    }
+
 } // namespace
 
 namespace systems::leal::campello_llm
 {
+
+    void buildGpt2ByteToUnicode(std::array<char32_t, 256> &out)
+    {
+        out.fill(0);
+        for (int b = '!'; b <= '~'; ++b)
+        {
+            out[static_cast<std::uint8_t>(b)] = static_cast<char32_t>(b);
+        }
+        for (int b = 0xA1; b <= 0xAC; ++b)
+        {
+            out[static_cast<std::uint8_t>(b)] = static_cast<char32_t>(b);
+        }
+        for (int b = 0xAE; b <= 0xFF; ++b)
+        {
+            out[static_cast<std::uint8_t>(b)] = static_cast<char32_t>(b);
+        }
+        int n = 0;
+        for (int b = 0; b < 256; ++b)
+        {
+            if (out[static_cast<std::uint8_t>(b)] == 0)
+            {
+                out[static_cast<std::uint8_t>(b)] = static_cast<char32_t>(256 + n);
+                ++n;
+            }
+        }
+    }
 
     std::optional<std::int32_t> Tokenizer::tokenToId(const std::string &token) const
     {
@@ -271,8 +356,21 @@ namespace systems::leal::campello_llm
             {
                 return;
             }
-            std::string normalized = hasNormalizer_ ? (kSpaceMarker + replaceSpacesWithMarker(pending))
-                                                      : pending;
+            std::string normalized;
+            if (model_ == TokenizerModel::Gpt2ByteLevel)
+            {
+                // Convert UTF-8 bytes to their GPT-2 byte-level Unicode representation.
+                normalized.reserve(pending.size());
+                for (unsigned char b : pending)
+                {
+                    normalized += char32ToUtf8(byteToUnicode_[b]);
+                }
+            }
+            else
+            {
+                normalized = hasNormalizer_ ? (kSpaceMarker + replaceSpacesWithMarker(pending))
+                                            : pending;
+            }
             auto ids = bpeTokenizeWord(normalized);
             contentIds.insert(contentIds.end(), ids.begin(), ids.end());
             pending.clear();
@@ -324,6 +422,72 @@ namespace systems::leal::campello_llm
                     specialIds.insert(added.id);
                 }
             }
+        }
+
+        if (model_ == TokenizerModel::Gpt2ByteLevel)
+        {
+            std::string result;
+            std::string pendingNormal;
+            auto flushNormal = [&]() {
+                if (pendingNormal.empty())
+                {
+                    return;
+                }
+                std::vector<std::uint8_t> bytes;
+                bytes.reserve(pendingNormal.size());
+                std::size_t pos = 0;
+                while (pos < pendingNormal.size())
+                {
+                    std::size_t len = utf8CharLen(static_cast<unsigned char>(pendingNormal[pos]));
+                    len = std::min(len, pendingNormal.size() - pos);
+                    char32_t uc = utf8CharToCodePoint(pendingNormal.substr(pos, len));
+                    auto it = unicodeToByte_.find(uc);
+                    if (it == unicodeToByte_.end())
+                    {
+                        // Defensive: if a normal token contains a char outside the
+                        // bytes-to-unicode table, emit the UTF-8 bytes literally.
+                        for (std::size_t k = 0; k < len; ++k)
+                        {
+                            bytes.push_back(static_cast<std::uint8_t>(pendingNormal[pos + k]));
+                        }
+                    }
+                    else
+                    {
+                        bytes.push_back(it->second);
+                    }
+                    pos += len;
+                }
+                result.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+                pendingNormal.clear();
+            };
+
+            for (std::int32_t id : ids)
+            {
+                if (skipSpecialTokens && specialIds.count(id) != 0)
+                {
+                    continue;
+                }
+                bool isSpecial = false;
+                for (const AddedToken &added : addedTokens_)
+                {
+                    if (added.id == id)
+                    {
+                        isSpecial = true;
+                        break;
+                    }
+                }
+                if (isSpecial)
+                {
+                    flushNormal();
+                    result += idToToken(id);
+                }
+                else
+                {
+                    pendingNormal += idToToken(id);
+                }
+            }
+            flushNormal();
+            return result;
         }
 
         std::vector<std::string> tokens;
