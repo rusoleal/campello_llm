@@ -46,6 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.2.0-era `CLAUDE.md`/`TODO.md` explicitly called out as not yet wired is closed.
 - Bumped `campello_nn` dependency from `v0.4.0` to `v0.5.0`.
 
+### Fixed
+- `campello_llm_tests`/`campello_llm_cli_chat` failed to even launch on Windows
+  (`STATUS_DLL_NOT_FOUND` / exit code `0xc0000135`) — Windows has no rpath/install_name equivalent,
+  and neither executable copied `campello_gpu.dll` (built `SHARED` there, pulled in transitively via
+  `campello_nn`) or `DirectML.dll` (always linked into `campello_nn`'s static lib on Windows) next
+  to itself. Added post-build copy steps to both (`tests/CMakeLists.txt`,
+  `examples/cli_chat/CMakeLists.txt`), reading `DirectML.dll`'s path off a new `campello_nn` target
+  property (`CAMPELLO_NN_DIRECTML_DLL` — see `campello_nn` v0.5.0's changelog for why a target
+  property was needed instead of the plain variable `campello_nn`'s own tests use for this) and
+  `campello_gpu.dll`'s path directly via `$<TARGET_FILE:campello_gpu>`.
+
 ## [0.2.0] - 2026-07-04
 
 ### Added

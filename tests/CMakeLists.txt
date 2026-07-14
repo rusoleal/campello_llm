@@ -37,5 +37,24 @@ set_target_properties(campello_llm_tests PROPERTIES
     CXX_STANDARD 20
 )
 
+if(WIN32)
+    # Windows has no rpath/install_name equivalent — campello_gpu (built SHARED
+    # there, pulled in transitively via campello_nn) and DirectML.dll (always
+    # linked into campello_nn's static lib on Windows, see campello_nn's
+    # cmake/windows.cmake) must be physically copied next to this executable,
+    # or it fails to even launch (STATUS_DLL_NOT_FOUND / exit code 0xc0000135)
+    # when gtest_discover_tests()'s post-build step tries to run it. campello_gpu
+    # is a real CMake target, resolvable directly; DirectML.dll isn't (linked via
+    # a raw file path, not an IMPORTED target), so it's read back off a target
+    # property campello_nn exposes for exactly this reason.
+    get_target_property(_campello_llm_directml_dll campello_nn CAMPELLO_NN_DIRECTML_DLL)
+    add_custom_command(TARGET campello_llm_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_campello_llm_directml_dll}"
+            "$<TARGET_FILE:campello_gpu>"
+            "$<TARGET_FILE_DIR:campello_llm_tests>"
+    )
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(campello_llm_tests)
