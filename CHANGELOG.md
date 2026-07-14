@@ -55,7 +55,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `examples/cli_chat/CMakeLists.txt`), reading `DirectML.dll`'s path off a new `campello_nn` target
   property (`CAMPELLO_NN_DIRECTML_DLL` — see `campello_nn` v0.5.0's changelog for why a target
   property was needed instead of the plain variable `campello_nn`'s own tests use for this) and
-  `campello_gpu.dll`'s path directly via `$<TARGET_FILE:campello_gpu>`.
+  `campello_gpu.dll`'s path directly via `$<TARGET_FILE:campello_gpu>`. Both new copy steps also
+  fail with a clear `FATAL_ERROR` at CMake-configure time if that property is missing (i.e. the
+  fetched `campello_nn` predates it) instead of a cryptic build-time `-NOTFOUND` copy error.
+- Raised `gtest_discover_tests()`'s `DISCOVERY_TIMEOUT` for `campello_llm_tests` from the 5-second
+  default to 60 — seen to matter on Windows CI runners in `campello_nn`'s equivalent step (a
+  freshly built `.exe`/`.dll` pair can get held up by antivirus/Defender scanning on first
+  execution).
 
 ## [0.2.0] - 2026-07-04
 

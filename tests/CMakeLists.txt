@@ -48,6 +48,12 @@ if(WIN32)
     # a raw file path, not an IMPORTED target), so it's read back off a target
     # property campello_nn exposes for exactly this reason.
     get_target_property(_campello_llm_directml_dll campello_nn CAMPELLO_NN_DIRECTML_DLL)
+    if(NOT _campello_llm_directml_dll)
+        message(FATAL_ERROR
+            "campello_llm: campello_nn's CAMPELLO_NN_DIRECTML_DLL target property is not set — "
+            "the fetched campello_nn version (see the GIT_TAG in the top-level CMakeLists.txt) "
+            "predates that property's introduction. Bump to a campello_nn version that has it.")
+    endif()
     add_custom_command(TARGET campello_llm_tests POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${_campello_llm_directml_dll}"
@@ -57,4 +63,9 @@ if(WIN32)
 endif()
 
 include(GoogleTest)
-gtest_discover_tests(campello_llm_tests)
+# DISCOVERY_TIMEOUT above the 5s default: gtest_discover_tests() runs this
+# executable once (--gtest_list_tests) to enumerate tests, and on Windows CI
+# runners a freshly-built .exe/.dll pair can get held up by antivirus/Defender
+# scanning on first execution, occasionally exceeding 5s (seen in practice on
+# campello_nn's equivalent step: "Process terminated due to timeout").
+gtest_discover_tests(campello_llm_tests DISCOVERY_TIMEOUT 60)
